@@ -48,80 +48,131 @@ void PrintElapsedTime(const Timer& timer) {
   std::cout << StringPrintf(" in %.3fs", timer.ElapsedSeconds()) << std::endl;
 }
 
+/**
+ * [功能描述]：将所有图像的特征索引到视觉索引（词汇树）中。
+ *             该函数遍历每张图像，提取其关键点和描述子，然后将特征量化为视觉词汇
+ *             并添加到倒排索引中，最后计算TF-IDF权重用于图像检索。
+ * @param num_threads：并行处理使用的线程数
+ * @param num_checks：近似最近邻搜索时的检查次数（影响搜索精度和速度）
+ * @param max_num_features：每张图像使用的最大特征数量（0表示不限制）
+ * @param image_ids：待索引的图像ID列表
+ * @param thread：线程对象指针，用于检查是否被外部停止
+ * @param cache：特征缓存对象指针，用于获取图像的关键点和描述子
+ * @param visual_index：视觉索引对象指针，用于存储索引结果
+ */
 void IndexImagesInVisualIndex(const int num_threads, const int num_checks,
                               const int max_num_features,
                               const std::vector<image_t>& image_ids,
                               Thread* thread, FeatureMatcherCache* cache,
                               retrieval::VisualIndex<>* visual_index) {
+  // 设置索引选项
   retrieval::VisualIndex<>::IndexOptions index_options;
-  index_options.num_threads = num_threads;
-  index_options.num_checks = num_checks;
+  index_options.num_threads = num_threads;  // 设置并行线程数
+  index_options.num_checks = num_checks;    // 设置近似最近邻搜索的检查次数
 
+  // 遍历所有图像，逐一将特征添加到视觉索引中
   for (size_t i = 0; i < image_ids.size(); ++i) {
+    // 检查是否被外部停止（如用户取消操作）
     if (thread->IsStopped()) {
       return;
     }
 
+    // 启动计时器，用于统计单张图像的索引耗时
     Timer timer;
     timer.Start();
 
+    // 打印当前处理进度
     std::cout << StringPrintf("Indexing image [%d/%d]", i + 1, image_ids.size())
               << std::flush;
 
+    // 从缓存中获取当前图像的关键点和描述子
     auto keypoints = *cache->GetKeypoints(image_ids[i]);
     auto descriptors = *cache->GetDescriptors(image_ids[i]);
+    
+    // 如果特征数量超过限制，只保留尺度最大的特征点
+    // 尺度大的特征点通常更加稳定和具有区分性
     if (max_num_features > 0 && descriptors.rows() > max_num_features) {
       ExtractTopScaleFeatures(&keypoints, &descriptors, max_num_features);
     }
 
+    // 将当前图像的特征添加到视觉索引中
+    // 这一步会将描述子量化为视觉词汇，并更新倒排索引
     visual_index->Add(index_options, image_ids[i], keypoints, descriptors);
 
+    // 打印当前图像的索引耗时
     PrintElapsedTime(timer);
   }
 
-  // Compute the TF-IDF weights, etc.
+  // 完成所有图像索引后，计算TF-IDF权重等统计信息
+  // TF-IDF用于衡量视觉词汇对图像检索的重要程度
   visual_index->Prepare();
 }
 
+/**
+ * [功能描述]：在视觉索引中进行最近邻检索并执行特征匹配。
+ *             该函数采用生产者-消费者模式：线程池并行执行图像检索（生产者），
+ *             主线程对检索到的相似图像对进行特征匹配（消费者）。
+ * @param num_threads：并行检索使用的线程数
+ * @param num_images：每次查询返回的最大图像数
+ * @param num_neighbors：近似最近邻搜索中每个特征的邻居数
+ * @param num_checks：近似最近邻搜索的检查次数
+ * @param num_images_after_verification：几何验证后保留的图像数量
+ * @param max_num_features：每张图像使用的最大特征数量
+ * @param image_ids：待匹配的图像ID列表
+ * @param thread：线程对象指针，用于检查是否被外部停止
+ * @param cache：特征缓存对象指针，用于获取图像的关键点和描述子
+ * @param visual_index：视觉索引对象指针，用于执行图像检索
+ * @param matcher：SIFT特征匹配器指针，用于执行详细的特征匹配
+ */
 void MatchNearestNeighborsInVisualIndex(
     const int num_threads, const int num_images, const int num_neighbors,
     const int num_checks, const int num_images_after_verification,
     const int max_num_features, const std::vector<image_t>& image_ids,
     Thread* thread, FeatureMatcherCache* cache,
     retrieval::VisualIndex<>* visual_index, SiftFeatureMatcher* matcher) {
+  // 定义检索结果结构体，包含查询图像ID和相似图像得分列表
   struct Retrieval {
-    image_t image_id = kInvalidImageId;
-    std::vector<retrieval::ImageScore> image_scores;
+    image_t image_id = kInvalidImageId;                   // 查询图像的ID
+    std::vector<retrieval::ImageScore> image_scores;      // 检索到的相似图像及其得分
   };
 
-  // Create a thread pool to retrieve the nearest neighbors.
+  // 创建线程池用于并行执行图像检索任务
   ThreadPool retrieval_thread_pool(num_threads);
+  // 创建任务队列用于存储检索结果（生产者-消费者模式）
   JobQueue<Retrieval> retrieval_queue(num_threads);
 
-  // The retrieval thread kernel function. Note that the descriptors should be
-  // extracted outside of this function sequentially to avoid any concurrent
-  // access to the database causing race conditions.
+  // 设置视觉索引查询选项
+  // 注意：描述子的提取需要在此函数外部顺序执行，
+  // 以避免并发访问数据库导致的竞态条件
   retrieval::VisualIndex<>::QueryOptions query_options;
-  query_options.max_num_images = num_images;
-  query_options.num_neighbors = num_neighbors;
-  query_options.num_checks = num_checks;
-  query_options.num_images_after_verification = num_images_after_verification;
+  query_options.max_num_images = num_images;                                // 返回的最大图像数
+  query_options.num_neighbors = num_neighbors;                              // 每个特征的近邻数
+  query_options.num_checks = num_checks;                                    // 近似搜索检查次数
+  query_options.num_images_after_verification = num_images_after_verification;  // 几何验证后保留数
+  
+  // 定义查询函数（Lambda），作为线程池的工作单元
   auto QueryFunc = [&](const image_t image_id) {
+    // 从缓存获取关键点和描述子
     auto keypoints = *cache->GetKeypoints(image_id);
     auto descriptors = *cache->GetDescriptors(image_id);
+    
+    // 如果特征数超过限制，只保留尺度最大的特征
     if (max_num_features > 0 && descriptors.rows() > max_num_features) {
       ExtractTopScaleFeatures(&keypoints, &descriptors, max_num_features);
     }
 
+    // 执行视觉索引查询，获取相似图像列表
     Retrieval retrieval;
     retrieval.image_id = image_id;
     visual_index->Query(query_options, keypoints, descriptors,
                         &retrieval.image_scores);
 
+    // 将检索结果推入队列，供主线程消费
     CHECK(retrieval_queue.Push(std::move(retrieval)));
   };
 
-  // Initially, make all retrieval threads busy and continue with the matching.
+  // 初始化阶段：预先向线程池提交任务，让所有线程开始工作
+  // 提交数量为 min(图像总数, 2*线程数)，确保线程池有足够任务
   size_t image_idx = 0;
   const size_t init_num_tasks =
       std::min(image_ids.size(), 2 * retrieval_thread_pool.NumThreads());
@@ -129,43 +180,51 @@ void MatchNearestNeighborsInVisualIndex(
     retrieval_thread_pool.AddTask(QueryFunc, image_ids[image_idx]);
   }
 
+  // 存储待匹配的图像对
   std::vector<std::pair<image_t, image_t>> image_pairs;
 
-  // Pop the finished retrieval results and enqueue them for feature matching.
+  // 主循环：从队列中获取检索结果，并执行特征匹配
   for (size_t i = 0; i < image_ids.size(); ++i) {
+    // 检查是否被外部停止
     if (thread->IsStopped()) {
       retrieval_queue.Stop();
       return;
     }
 
+    // 启动计时器
     Timer timer;
     timer.Start();
 
+    // 打印当前匹配进度
     std::cout << StringPrintf("Matching image [%d/%d]", i + 1, image_ids.size())
               << std::flush;
 
-    // Push the next image to the retrieval queue.
+    // 向线程池提交下一个检索任务（保持流水线运行）
     if (image_idx < image_ids.size()) {
       retrieval_thread_pool.AddTask(QueryFunc, image_ids[image_idx]);
       image_idx += 1;
     }
 
-    // Pop the next results from the retrieval queue.
+    // 从队列中取出下一个检索结果（阻塞等待）
     auto retrieval = retrieval_queue.Pop();
     CHECK(retrieval.IsValid());
 
+    // 获取检索结果中的图像ID和相似图像得分列表
     const auto& image_id = retrieval.Data().image_id;
     const auto& image_scores = retrieval.Data().image_scores;
 
-    // Compose the image pairs from the scores.
+    // 根据检索得分构建图像对列表
+    // 每个图像对由查询图像和检索到的相似图像组成
     image_pairs.clear();
     image_pairs.reserve(image_scores.size());
     for (const auto image_score : image_scores) {
       image_pairs.emplace_back(image_id, image_score.image_id);
     }
 
+    // 对构建的图像对执行详细的SIFT特征匹配
     matcher->Match(image_pairs);
 
+    // 打印当前图像的匹配耗时
     PrintElapsedTime(timer);
   }
 }
@@ -977,22 +1036,39 @@ SequentialFeatureMatcher::SequentialFeatureMatcher(
   CHECK(match_options_.Check());
 }
 
+/**
+ * [功能描述]：顺序特征匹配器的主运行函数。
+ *             该函数用于处理按时间或空间顺序采集的图像序列（如视频帧），
+ *             先对相邻图像进行特征匹配，然后可选地执行回环检测以建立
+ *             非相邻图像之间的匹配关系。
+ */
 void SequentialFeatureMatcher::Run() {
+  // 打印标题信息
   PrintHeading1("Sequential feature matching");
 
+  // 初始化特征匹配器，如果失败则直接返回
   if (!matcher_.Setup()) {
     return;
   }
 
+  // 初始化特征缓存
   cache_.Setup();
 
+  // 获取按顺序排列的图像ID列表
+  // 图像顺序通常由文件名或数据库中的记录顺序决定
   const std::vector<image_t> ordered_image_ids = GetOrderedImageIds();
 
+  // 执行顺序匹配：对相邻的图像对进行特征匹配
+  // 例如：图像1与图像2匹配，图像2与图像3匹配，以此类推
   RunSequentialMatching(ordered_image_ids);
+  
+  // 如果启用了回环检测，则执行回环检测
+  // 回环检测用于发现序列中相隔较远但场景相似的图像
   if (options_.loop_detection) {
     RunLoopDetection(ordered_image_ids);
   }
 
+  // 打印总耗时
   GetTimer().PrintMinutes();
 }
 
@@ -1062,36 +1138,52 @@ void SequentialFeatureMatcher::RunSequentialMatching(
   }
 }
 
+/**
+ * [功能描述]：执行回环检测（Loop Detection）。
+ *             回环检测用于检测相机是否回到了之前访问过的位置，
+ *             通过建立非相邻图像之间的匹配关系来减少累积漂移误差。
+ *             该函数使用词汇树进行高效的图像相似度检索。
+ * @param image_ids：按拍摄顺序排列的图像ID列表
+ */
 void SequentialFeatureMatcher::RunLoopDetection(
     const std::vector<image_t>& image_ids) {
-  // Read the pre-trained vocabulary tree from disk.
+  // 从磁盘读取预训练的词汇树文件
   retrieval::VisualIndex<> visual_index;
   visual_index.Read(options_.vocab_tree_path);
 
-  // Index all images in the visual index.
-  IndexImagesInVisualIndex(match_options_.num_threads,
-                           options_.loop_detection_num_checks,
-                           options_.loop_detection_max_num_features, image_ids,
+  // 将所有图像的特征索引到视觉索引中
+  // 这一步构建倒排索引，用于后续的快速图像检索
+  IndexImagesInVisualIndex(match_options_.num_threads,              // 并行线程数
+                           options_.loop_detection_num_checks,      // 近似搜索检查次数
+                           options_.loop_detection_max_num_features,  // 每张图像的最大特征数
+                           image_ids,                               // 所有图像ID
                            this, &cache_, &visual_index);
 
+  // 检查是否被外部停止
   if (IsStopped()) {
     return;
   }
 
-  // Only perform loop detection for every n-th image.
+  // 按周期采样图像，只对每隔 n 张图像执行回环检测
+  // 这样可以减少计算量，同时仍能有效检测回环
+  // loop_detection_period 定义了采样间隔
   std::vector<image_t> match_image_ids;
   for (size_t i = 0; i < image_ids.size();
        i += options_.loop_detection_period) {
     match_image_ids.push_back(image_ids[i]);
   }
 
+  // 对采样的图像执行最近邻检索和特征匹配
+  // 通过词汇树找到与当前图像最相似的历史图像，建立回环约束
   MatchNearestNeighborsInVisualIndex(
-      match_options_.num_threads, options_.loop_detection_num_images,
-      options_.loop_detection_num_nearest_neighbors,
-      options_.loop_detection_num_checks,
-      options_.loop_detection_num_images_after_verification,
-      options_.loop_detection_max_num_features, match_image_ids, this, &cache_,
-      &visual_index, &matcher_);
+      match_options_.num_threads,                           // 并行线程数
+      options_.loop_detection_num_images,                   // 返回的最大图像数
+      options_.loop_detection_num_nearest_neighbors,        // 每个特征的近邻数
+      options_.loop_detection_num_checks,                   // 近似搜索检查次数
+      options_.loop_detection_num_images_after_verification,  // 几何验证后保留的图像数
+      options_.loop_detection_max_num_features,             // 每张图像的最大特征数
+      match_image_ids,                                      // 待匹配的采样图像
+      this, &cache_, &visual_index, &matcher_);
 }
 
 VocabTreeFeatureMatcher::VocabTreeFeatureMatcher(
@@ -1106,25 +1198,41 @@ VocabTreeFeatureMatcher::VocabTreeFeatureMatcher(
   CHECK(match_options_.Check());
 }
 
+/**
+ * [功能描述]：词汇树特征匹配器的核心运行函数。
+ *             该函数使用预训练的词汇树（Vocabulary Tree）进行图像检索和特征匹配，
+ *             通过视觉词汇索引快速找到相似图像对，然后对这些图像对进行详细的特征匹配。
+ */
 void VocabTreeFeatureMatcher::Run() {
+  // 打印标题信息
   PrintHeading1("Vocabulary tree feature matching");
 
+  // 初始化特征匹配器，如果失败则直接返回
   if (!matcher_.Setup()) {
     return;
   }
 
+  // 初始化特征缓存（用于缓存图像特征数据）
   cache_.Setup();
 
-  // Read the pre-trained vocabulary tree from disk.
+  // 从磁盘读取预训练的词汇树文件
+  // 词汇树是通过聚类大量SIFT描述子构建的层次化视觉词汇表
   retrieval::VisualIndex<> visual_index;
   visual_index.Read(options_.vocab_tree_path);
 
+  // 获取数据库中所有图像的ID列表
   const std::vector<image_t> all_image_ids = cache_.GetImageIds();
+  
+  // 待匹配的图像ID列表（可能是全部图像或用户指定的子集）
   std::vector<image_t> image_ids;
+  
   if (options_.match_list_path == "") {
+    // 如果没有指定匹配列表文件，则使用所有图像
     image_ids = cache_.GetImageIds();
   } else {
-    // Map image names to image identifiers.
+    // 如果指定了匹配列表文件，则只匹配列表中的图像
+    
+    // 构建图像名称到图像ID的映射表，用于快速查找
     std::unordered_map<std::string, image_t> image_name_to_image_id;
     image_name_to_image_id.reserve(all_image_ids.size());
     for (const auto image_id : all_image_ids) {
@@ -1132,17 +1240,20 @@ void VocabTreeFeatureMatcher::Run() {
       image_name_to_image_id.emplace(image.Name(), image_id);
     }
 
-    // Read the match list path.
+    // 读取匹配列表文件，文件中每行一个图像名称
     std::ifstream file(options_.match_list_path);
     CHECK(file.is_open()) << options_.match_list_path;
     std::string line;
     while (std::getline(file, line)) {
+      // 去除行首尾空白字符
       StringTrim(&line);
 
+      // 跳过空行和注释行（以#开头）
       if (line.empty() || line[0] == '#') {
         continue;
       }
 
+      // 查找图像名称对应的ID并添加到待匹配列表
       if (image_name_to_image_id.count(line) == 0) {
         std::cerr << "ERROR: Image " << line << " does not exist." << std::endl;
       } else {
@@ -1151,23 +1262,38 @@ void VocabTreeFeatureMatcher::Run() {
     }
   }
 
-  // Index all images in the visual index.
-  IndexImagesInVisualIndex(match_options_.num_threads, options_.num_checks,
-                           options_.max_num_features, all_image_ids, this,
-                           &cache_, &visual_index);
+  // 将所有图像的特征索引到视觉索引中
+  // 这一步将每张图像的SIFT特征量化为视觉词汇，建立倒排索引
+  IndexImagesInVisualIndex(match_options_.num_threads,  // 并行线程数
+                           options_.num_checks,          // 近似最近邻搜索的检查次数
+                           options_.max_num_features,    // 每张图像使用的最大特征数
+                           all_image_ids,                // 所有图像ID
+                           this,                         // 当前匹配器实例
+                           &cache_,                      // 特征缓存
+                           &visual_index);               // 视觉索引
 
+  // 检查是否被外部停止（如用户取消操作）
   if (IsStopped()) {
     GetTimer().PrintMinutes();
     return;
   }
 
-  // Match all images in the visual index.
+  // 在视觉索引中进行最近邻匹配
+  // 对于每张待匹配图像，检索其在词汇树中的最近邻图像，然后进行详细特征匹配
   MatchNearestNeighborsInVisualIndex(
-      match_options_.num_threads, options_.num_images,
-      options_.num_nearest_neighbors, options_.num_checks,
-      options_.num_images_after_verification, options_.max_num_features,
-      image_ids, this, &cache_, &visual_index, &matcher_);
+      match_options_.num_threads,              // 并行线程数
+      options_.num_images,                     // 每次批量处理的图像数
+      options_.num_nearest_neighbors,          // 每张图像检索的最近邻数量
+      options_.num_checks,                     // 近似最近邻搜索的检查次数
+      options_.num_images_after_verification,  // 几何验证后保留的图像数
+      options_.max_num_features,               // 每张图像使用的最大特征数
+      image_ids,                               // 待匹配的图像ID列表
+      this,                                    // 当前匹配器实例
+      &cache_,                                 // 特征缓存
+      &visual_index,                           // 视觉索引
+      &matcher_);                              // 特征匹配器
 
+  // 打印总耗时
   GetTimer().PrintMinutes();
 }
 

@@ -182,76 +182,100 @@ int RunColorExtractor(int argc, char** argv) {
   return EXIT_SUCCESS;
 }
 
+/**
+ * [功能描述]：运行增量式三维重建（Incremental SfM）的主函数。
+ *             该函数负责解析命令行参数、初始化重建管理器、执行增量式映射，
+ *             并将重建结果保存到指定的输出目录。
+ * @param argc：命令行参数数量
+ * @param argv：命令行参数数组
+ * @return 成功返回 EXIT_SUCCESS，失败返回 EXIT_FAILURE
+ */
 int RunMapper(int argc, char** argv) {
-  std::string input_path;
-  std::string output_path;
-  std::string image_list_path;
+  // 定义路径变量
+  std::string input_path;       // 输入路径，用于从已有重建继续
+  std::string output_path;      // 输出路径，用于保存重建结果
+  std::string image_list_path;  // 图像列表文件路径，用于指定参与重建的图像子集
 
+  // 创建选项管理器并添加各类选项
   OptionManager options;
-  options.AddDatabaseOptions();
-  options.AddImageOptions();
-  options.AddDefaultOption("input_path", &input_path);
-  options.AddRequiredOption("output_path", &output_path);
-  options.AddDefaultOption("image_list_path", &image_list_path);
-  options.AddMapperOptions();
-  options.Parse(argc, argv);
+  options.AddDatabaseOptions();                                   // 添加数据库相关选项
+  options.AddImageOptions();                                      // 添加图像相关选项
+  options.AddDefaultOption("input_path", &input_path);            // 添加可选的输入路径参数
+  options.AddRequiredOption("output_path", &output_path);         // 添加必需的输出路径参数
+  options.AddDefaultOption("image_list_path", &image_list_path);  // 添加可选的图像列表路径参数
+  options.AddMapperOptions();                                     // 添加映射器相关选项
+  options.Parse(argc, argv);                                      // 解析命令行参数
 
+  // 验证输出路径是否为有效目录
   if (!ExistsDir(output_path)) {
     std::cerr << "ERROR: `output_path` is not a directory." << std::endl;
     return EXIT_FAILURE;
   }
 
+  // 如果指定了图像列表文件，则读取并设置参与重建的图像名称集合
   if (!image_list_path.empty()) {
     const auto image_names = ReadTextFileLines(image_list_path);
     options.mapper->image_names =
         std::unordered_set<std::string>(image_names.begin(), image_names.end());
   }
 
+  // 创建重建管理器，用于管理一个或多个重建模型
   ReconstructionManager reconstruction_manager;
+  
+  // 如果指定了输入路径，从已有重建继续
   if (input_path != "") {
     if (!ExistsDir(input_path)) {
       std::cerr << "ERROR: `input_path` is not a directory." << std::endl;
       return EXIT_FAILURE;
     }
+    // 读取已有的重建数据
     reconstruction_manager.Read(input_path);
   }
 
+  // 创建增量式映射控制器，负责执行增量式SfM流程
   IncrementalMapperController mapper(options.mapper.get(), *options.image_path,
                                      *options.database_path,
                                      &reconstruction_manager);
 
-  // In case a new reconstruction is started, write results of individual sub-
-  // models to as their reconstruction finishes instead of writing all results
-  // after all reconstructions finished.
-  size_t prev_num_reconstructions = 0;
+  // 当从头开始新的重建时，设置回调函数：
+  // 每当一个子模型重建完成时立即保存结果，而不是等待所有重建完成后再保存
+  size_t prev_num_reconstructions = 0;  // 记录上一次保存时的重建数量
   if (input_path == "") {
+    // 注册回调函数，在最后一张图像注册完成时触发
     mapper.AddCallback(
         IncrementalMapperController::LAST_IMAGE_REG_CALLBACK, [&]() {
-          // If the number of reconstructions has not changed, the last model
-          // was discarded for some reason.
+          // 如果重建数量增加了，说明有新的模型完成
+          // 如果数量未变，说明最后的模型因某些原因被丢弃
           if (reconstruction_manager.Size() > prev_num_reconstructions) {
+            // 构建子模型的保存路径，例如 output_path/0, output_path/1 等
             const std::string reconstruction_path = JoinPaths(
                 output_path, std::to_string(prev_num_reconstructions));
             const auto& reconstruction =
                 reconstruction_manager.Get(prev_num_reconstructions);
+            // 创建子模型目录并保存重建结果
             CreateDirIfNotExists(reconstruction_path);
             reconstruction.Write(reconstruction_path);
+            // 同时保存项目配置文件
             options.Write(JoinPaths(reconstruction_path, "project.ini"));
+            // 更新已保存的重建数量
             prev_num_reconstructions = reconstruction_manager.Size();
           }
         });
   }
 
+  // 启动增量式映射过程
   mapper.Start();
+  // 等待映射过程完成
   mapper.Wait();
 
+  // 检查是否成功创建了稀疏模型
   if (reconstruction_manager.Size() == 0) {
     std::cerr << "ERROR: failed to create sparse model" << std::endl;
     return EXIT_FAILURE;
   }
 
-  // In case the reconstruction is continued from an existing reconstruction, do
-  // not create sub-folders but directly write the results.
+  // 如果是从已有重建继续的情况，直接将结果写入输出路径
+  // 不创建子文件夹，因为这是对现有模型的扩展
   if (input_path != "" && reconstruction_manager.Size() > 0) {
     reconstruction_manager.Get(0).Write(output_path);
   }

@@ -382,30 +382,47 @@ int RunTransitiveMatcher(int argc, char** argv) {
   return EXIT_SUCCESS;
 }
 
+/**
+ * [功能描述]：运行基于词汇树（Vocabulary Tree）的特征匹配器。
+ *             词汇树是一种高效的图像检索方法，通过视觉词汇表快速找到相似图像，
+ *             从而减少需要进行详细特征匹配的图像对数量，适用于大规模数据集。
+ * @param argc：命令行参数数量
+ * @param argv：命令行参数数组
+ * @return 成功返回 EXIT_SUCCESS，失败返回 EXIT_FAILURE
+ */
 int RunVocabTreeMatcher(int argc, char** argv) {
+  // 创建选项管理器并添加相关选项
   OptionManager options;
-  options.AddDatabaseOptions();
-  options.AddVocabTreeMatchingOptions();
-  options.Parse(argc, argv);
+  options.AddDatabaseOptions();           // 添加数据库相关选项
+  options.AddVocabTreeMatchingOptions();  // 添加词汇树匹配相关选项
+  options.Parse(argc, argv);              // 解析命令行参数
 
+  // 验证SIFT GPU参数是否有效，如果无效则退出
   if (!VerifySiftGPUParams(options.sift_matching->use_gpu)) {
     return EXIT_FAILURE;
   }
 
+  // 如果使用GPU且启用OpenGL，需要创建QApplication实例
+  // QApplication是Qt图形界面应用的基础，OpenGL上下文需要它来初始化
   std::unique_ptr<QApplication> app;
   if (options.sift_matching->use_gpu && kUseOpenGL) {
     app.reset(new QApplication(argc, argv));
   }
 
+  // 创建词汇树特征匹配器实例
+  // 参数：词汇树匹配选项、SIFT匹配选项、数据库路径
   VocabTreeFeatureMatcher feature_matcher(*options.vocab_tree_matching,
                                           *options.sift_matching,
                                           *options.database_path);
 
+  // 根据是否使用GPU和OpenGL选择不同的执行方式
   if (options.sift_matching->use_gpu && kUseOpenGL) {
+    // 使用OpenGL上下文运行匹配线程（GPU加速模式）
     RunThreadWithOpenGLContext(&feature_matcher);
   } else {
+    // 直接启动匹配线程（CPU模式或非OpenGL的GPU模式）
     feature_matcher.Start();
-    feature_matcher.Wait();
+    feature_matcher.Wait();  // 等待匹配完成
   }
 
   return EXIT_SUCCESS;
