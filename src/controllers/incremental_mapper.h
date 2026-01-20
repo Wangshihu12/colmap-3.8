@@ -136,6 +136,15 @@ struct IncrementalMapperOptions {
   // If reconstruction is provided as input, fix the existing image poses.
   bool fix_existing_images = false;
 
+  // Path to relative pose constraints for bundle adjustment.
+  std::string relative_pose_path;
+  bool relative_pose_from_database = true;
+  double relative_pose_rotation_weight = 10.0;
+  double relative_pose_translation_weight = 100.0;
+
+  // Normalize the scene after global bundle adjustment.
+  bool normalize_scene = false;
+
   IncrementalMapper::Options Mapper() const;
   IncrementalTriangulator::Options Triangulation() const;
   BundleAdjustmentOptions LocalBundleAdjustment() const;
@@ -182,6 +191,7 @@ class IncrementalMapperController : public Thread {
   const std::string database_path_;
   ReconstructionManager* reconstruction_manager_;
   DatabaseCache database_cache_;
+  std::vector<RelativePoseConstraint> relative_pose_constraints_;
 };
 
 // Globally filter points and images in mapper.

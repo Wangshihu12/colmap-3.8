@@ -119,6 +119,9 @@ class IncrementalMapper {
     // If reconstruction is provided as input, fix the existing image poses.
     bool fix_existing_images = false;
 
+    // Normalize the scene after global bundle adjustment.
+    bool normalize_scene = false;
+
     // Number of threads.
     int num_threads = -1;
 
@@ -210,7 +213,7 @@ class IncrementalMapper {
   bool AdjustGlobalBundle(const Options& options,
                           const BundleAdjustmentOptions& ba_options);
   bool AdjustParallelGlobalBundle(
-      const BundleAdjustmentOptions& ba_options,
+      const Options& options, const BundleAdjustmentOptions& ba_options,
       const ParallelBundleAdjuster::Options& parallel_ba_options);
 
   // Filter images and point observations.
@@ -232,7 +235,12 @@ class IncrementalMapper {
   // Clear the collection of changed 3D points.
   void ClearModifiedPoints3D();
 
+  void SetRelativePoseConstraints(
+      const std::vector<RelativePoseConstraint>& constraints);
+
  private:
+  void AddRelativePoseConstraintsToConfig(
+      BundleAdjustmentConfig* config) const;
   // Find seed images for incremental reconstruction. Suitable seed images have
   // a large number of correspondences and have camera calibration priors. The
   // returned list is ordered such that most suitable images are in the front.
@@ -306,6 +314,8 @@ class IncrementalMapper {
   // This image list will be non-empty, if the reconstruction is continued from
   // an existing reconstruction.
   std::unordered_set<image_t> existing_image_ids_;
+
+  std::vector<RelativePoseConstraint> relative_pose_constraints_;
 };
 
 }  // namespace colmap

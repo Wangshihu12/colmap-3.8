@@ -31,7 +31,14 @@
 
 #include "controllers/incremental_mapper.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+
+#include "base/pose.h"
 #include "util/misc.h"
+#include "util/string.h"
 
 namespace colmap {
 namespace {
@@ -64,11 +71,14 @@ void AdjustGlobalBundle(const IncrementalMapperOptions& options,
 
   PrintHeading1("Global bundle adjustment");
   if (options.ba_global_use_pba && !options.fix_existing_images &&
+      options.relative_pose_path.empty() &&
+      !options.relative_pose_from_database &&
       num_reg_images >= kMinNumRegImagesForFastBA &&
       ParallelBundleAdjuster::IsSupported(custom_ba_options,
                                           mapper->GetReconstruction())) {
     mapper->AdjustParallelGlobalBundle(
-        custom_ba_options, options.ParallelGlobalBundleAdjustment());
+        options.Mapper(), custom_ba_options,
+        options.ParallelGlobalBundleAdjustment());
   } else {
     mapper->AdjustGlobalBundle(options.Mapper(), custom_ba_options);
   }
@@ -161,6 +171,233 @@ void WriteSnapshot(const Reconstruction& reconstruction,
   reconstruction.Write(path);
 }
 
+bool TryExtractTimestampFromName(const std::string& name,
+                                 int64_t* timestamp) {
+  std::string base = name;
+  const size_t slash_pos = base.find_last_of("/\\");
+  if (slash_pos != std::string::npos) {
+    base = base.substr(slash_pos + 1);
+  }
+  const size_t dot_pos = base.find_last_of('.');
+  if (dot_pos != std::string::npos) {
+    base = base.substr(0, dot_pos);
+  }
+
+  bool candidate_float = true;
+  bool has_digit = false;
+  bool has_dot = false;
+  for (const char ch : base) {
+    if (std::isdigit(static_cast<unsigned char>(ch)) != 0) {
+      has_digit = true;
+      continue;
+    }
+    if (ch == '.' && !has_dot) {
+      has_dot = true;
+      continue;
+    }
+    candidate_float = false;
+    break;
+  }
+
+  if (candidate_float && has_digit) {
+    try {
+      const double value = std::stod(base);
+      *timestamp = static_cast<int64_t>(std::llround(value * 1e6));
+      return true;
+    } catch (const std::exception&) {
+      return false;
+    }
+  }
+
+  size_t best_pos = std::string::npos;
+  size_t best_len = 0;
+  size_t run_start = 0;
+  size_t run_len = 0;
+
+  for (size_t i = 0; i <= base.size(); ++i) {
+    const bool is_digit =
+        (i < base.size()) &&
+        std::isdigit(static_cast<unsigned char>(base[i])) != 0;
+    if (is_digit) {
+      if (run_len == 0) {
+        run_start = i;
+      }
+      run_len += 1;
+    } else if (run_len > 0) {
+      if (run_len > best_len ||
+          (run_len == best_len && run_start > best_pos)) {
+        best_len = run_len;
+        best_pos = run_start;
+      }
+      run_len = 0;
+    }
+  }
+
+  if (best_len == 0) {
+    return false;
+  }
+
+  try {
+    *timestamp = std::stoll(base.substr(best_pos, best_len));
+  } catch (const std::exception&) {
+    return false;
+  }
+
+  return true;
+}
+
+std::vector<RelativePoseConstraint> ReadRelativePoseConstraints(
+    const std::string& path, const DatabaseCache& database_cache,
+    const double default_rot_weight, const double default_trans_weight) {
+  std::vector<RelativePoseConstraint> constraints;
+  if (path.empty()) {
+    return constraints;
+  }
+
+  const auto lines = ReadTextFileLines(path);
+  constraints.reserve(lines.size());
+
+  for (const auto& line : lines) {
+    std::string content = line;
+    const auto comment_pos = content.find('#');
+    if (comment_pos != std::string::npos) {
+      content = content.substr(0, comment_pos);
+    }
+    StringTrim(&content);
+    if (content.empty()) {
+      continue;
+    }
+
+    const auto elems = StringSplit(content, " \t");
+    if (elems.size() < 9) {
+      std::cout << "WARNING: Skipping invalid relative pose line: " << line
+                << std::endl;
+      continue;
+    }
+
+    const Image* image1 = database_cache.FindImageWithName(elems[0]);
+    const Image* image2 = database_cache.FindImageWithName(elems[1]);
+    if (image1 == nullptr || image2 == nullptr) {
+      std::cout << "WARNING: Skipping relative pose with unknown image: "
+                << line << std::endl;
+      continue;
+    }
+
+    try {
+      Eigen::Vector4d qvec;
+      Eigen::Vector3d tvec;
+      qvec(0) = std::stod(elems[2]);
+      qvec(1) = std::stod(elems[3]);
+      qvec(2) = std::stod(elems[4]);
+      qvec(3) = std::stod(elems[5]);
+      tvec(0) = std::stod(elems[6]);
+      tvec(1) = std::stod(elems[7]);
+      tvec(2) = std::stod(elems[8]);
+
+      const double qvec_norm = qvec.norm();
+      if (qvec_norm == 0.0) {
+        std::cout << "WARNING: Skipping relative pose with zero rotation: "
+                  << line << std::endl;
+        continue;
+      }
+      qvec /= qvec_norm;
+
+      double rot_weight = default_rot_weight;
+      double trans_weight = default_trans_weight;
+      if (elems.size() >= 11) {
+        rot_weight = std::stod(elems[9]);
+        trans_weight = std::stod(elems[10]);
+      }
+
+      RelativePoseConstraint constraint;
+      constraint.image_id1 = image1->ImageId();
+      constraint.image_id2 = image2->ImageId();
+      constraint.qvec12 = qvec;
+      constraint.tvec12 = tvec;
+      constraint.rot_weight = rot_weight;
+      constraint.trans_weight = trans_weight;
+      constraints.push_back(constraint);
+    } catch (const std::exception&) {
+      std::cout << "WARNING: Skipping invalid relative pose line: " << line
+                << std::endl;
+    }
+  }
+
+  return constraints;
+}
+
+std::vector<RelativePoseConstraint> BuildRelativePoseConstraintsFromDatabase(
+    const DatabaseCache& database_cache, const double default_rot_weight,
+    const double default_trans_weight) {
+  struct ImageStamp {
+    image_t image_id;
+    int64_t timestamp;
+  };
+
+  std::vector<ImageStamp> ordered_images;
+  ordered_images.reserve(database_cache.NumImages());
+
+  size_t num_missing_timestamp = 0;
+  size_t num_missing_priors = 0;
+
+  for (const auto& image_pair : database_cache.Images()) {
+    const Image& image = image_pair.second;
+    if (!image.HasQvecPrior() || !image.HasTvecPrior()) {
+      num_missing_priors += 1;
+      continue;
+    }
+
+    int64_t timestamp = 0;
+    if (!TryExtractTimestampFromName(image.Name(), &timestamp)) {
+      num_missing_timestamp += 1;
+      continue;
+    }
+
+    ordered_images.push_back({image.ImageId(), timestamp});
+  }
+
+  std::sort(ordered_images.begin(), ordered_images.end(),
+            [](const ImageStamp& a, const ImageStamp& b) {
+              if (a.timestamp == b.timestamp) {
+                return a.image_id < b.image_id;
+              }
+              return a.timestamp < b.timestamp;
+            });
+
+  if (num_missing_priors > 0) {
+    std::cout << "WARNING: " << num_missing_priors
+              << " images missing pose priors; skipped." << std::endl;
+  }
+  if (num_missing_timestamp > 0) {
+    std::cout << "WARNING: " << num_missing_timestamp
+              << " images missing timestamp in name; skipped." << std::endl;
+  }
+
+  std::vector<RelativePoseConstraint> constraints;
+  if (ordered_images.size() < 2) {
+    return constraints;
+  }
+
+  constraints.reserve(ordered_images.size() - 1);
+  for (size_t i = 0; i + 1 < ordered_images.size(); ++i) {
+    const Image& image1 = database_cache.Image(ordered_images[i].image_id);
+    const Image& image2 = database_cache.Image(ordered_images[i + 1].image_id);
+
+    RelativePoseConstraint constraint;
+    constraint.image_id1 = image1.ImageId();
+    constraint.image_id2 = image2.ImageId();
+    ComputeRelativePose(image1.QvecPrior(), image1.TvecPrior(),
+                        image2.QvecPrior(), image2.TvecPrior(),
+                        &constraint.qvec12, &constraint.tvec12);
+    constraint.qvec12 = NormalizeQuaternion(constraint.qvec12);
+    constraint.rot_weight = default_rot_weight;
+    constraint.trans_weight = default_trans_weight;
+    constraints.push_back(constraint);
+  }
+
+  return constraints;
+}
+
 }  // namespace
 
 size_t FilterPoints(const IncrementalMapperOptions& options,
@@ -202,6 +439,7 @@ IncrementalMapper::Options IncrementalMapperOptions::Mapper() const {
   options.num_threads = num_threads;
   options.local_ba_num_images = ba_local_num_images;
   options.fix_existing_images = fix_existing_images;
+  options.normalize_scene = normalize_scene;
   return options;
 }
 
@@ -296,6 +534,8 @@ bool IncrementalMapperOptions::Check() const {
   CHECK_OPTION_GT(ba_global_max_refinements, 0);
   CHECK_OPTION_GE(ba_global_max_refinement_change, 0);
   CHECK_OPTION_GE(snapshot_images_freq, 0);
+  CHECK_OPTION_GE(relative_pose_rotation_weight, 0);
+  CHECK_OPTION_GE(relative_pose_translation_weight, 0);
   CHECK_OPTION(Mapper().Check());
   CHECK_OPTION(Triangulation().Check());
   return true;
@@ -378,6 +618,26 @@ bool IncrementalMapperController::LoadDatabase() {
     return false;
   }
 
+  if (options_->relative_pose_from_database) {
+    if (!options_->relative_pose_path.empty()) {
+      std::cout << "WARNING: Ignoring Mapper.relative_pose_path because "
+                   "Mapper.relative_pose_from_database is enabled."
+                << std::endl;
+    }
+    relative_pose_constraints_ = BuildRelativePoseConstraintsFromDatabase(
+        database_cache_, options_->relative_pose_rotation_weight,
+        options_->relative_pose_translation_weight);
+    std::cout << "Loaded " << relative_pose_constraints_.size()
+              << " relative pose constraints from database." << std::endl;
+  } else if (!options_->relative_pose_path.empty()) {
+    relative_pose_constraints_ = ReadRelativePoseConstraints(
+        options_->relative_pose_path, database_cache_,
+        options_->relative_pose_rotation_weight,
+        options_->relative_pose_translation_weight);
+    std::cout << "Loaded " << relative_pose_constraints_.size()
+              << " relative pose constraints from file." << std::endl;
+  }
+
   return true;
 }
 
@@ -390,6 +650,7 @@ void IncrementalMapperController::Reconstruct(
   //////////////////////////////////////////////////////////////////////////////
 
   IncrementalMapper mapper(&database_cache_);
+  mapper.SetRelativePoseConstraints(relative_pose_constraints_);
 
   // Is there a sub-model before we start the reconstruction? I.e. the user
   // has imported an existing reconstruction.

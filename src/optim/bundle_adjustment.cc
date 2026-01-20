@@ -104,6 +104,10 @@ size_t BundleAdjustmentConfig::NumConstantPoints() const {
   return constant_point3D_ids_.size();
 }
 
+size_t BundleAdjustmentConfig::NumRelativePoseConstraints() const {
+  return relative_pose_constraints_.size();
+}
+
 size_t BundleAdjustmentConfig::NumResiduals(
     const Reconstruction& reconstruction) const {
   // Count the number of observations for all added images.
@@ -134,7 +138,7 @@ size_t BundleAdjustmentConfig::NumResiduals(
     num_observations += NumObservationsForPoint(point3D_id);
   }
 
-  return 2 * num_observations;
+  return 2 * num_observations + 6 * relative_pose_constraints_.size();
 }
 
 void BundleAdjustmentConfig::AddImage(const image_t image_id) {
@@ -245,6 +249,16 @@ void BundleAdjustmentConfig::RemoveConstantPoint(const point3D_t point3D_id) {
   constant_point3D_ids_.erase(point3D_id);
 }
 
+void BundleAdjustmentConfig::AddRelativePoseConstraint(
+    const RelativePoseConstraint& constraint) {
+  relative_pose_constraints_.push_back(constraint);
+}
+
+const std::vector<RelativePoseConstraint>&
+BundleAdjustmentConfig::RelativePoseConstraints() const {
+  return relative_pose_constraints_;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // BundleAdjuster
 ////////////////////////////////////////////////////////////////////////////////
@@ -336,6 +350,7 @@ void BundleAdjuster::SetUp(Reconstruction* reconstruction,
   for (const auto point3D_id : config_.ConstantPoints()) {
     AddPointToProblem(point3D_id, reconstruction, loss_function);
   }
+  AddRelativePoseConstraints(reconstruction, loss_function);
 
   ParameterizeCameras(reconstruction);
   ParameterizePoints(reconstruction);
@@ -474,6 +489,34 @@ void BundleAdjuster::AddPointToProblem(const point3D_t point3D_id,
     }
     problem_->AddResidualBlock(cost_function, loss_function,
                                point3D.XYZ().data(), camera.ParamsData());
+  }
+}
+
+void BundleAdjuster::AddRelativePoseConstraints(
+    Reconstruction* reconstruction, ceres::LossFunction* loss_function) {
+  if (!options_.refine_extrinsics) {
+    return;
+  }
+
+  for (const auto& constraint : config_.RelativePoseConstraints()) {
+    if (!config_.HasImage(constraint.image_id1) ||
+        !config_.HasImage(constraint.image_id2)) {
+      continue;
+    }
+
+    Image& image1 = reconstruction->Image(constraint.image_id1);
+    Image& image2 = reconstruction->Image(constraint.image_id2);
+    image1.NormalizeQvec();
+    image2.NormalizeQvec();
+
+    ceres::CostFunction* cost_function =
+        RelativePoseConstraintCostFunction::Create(
+            constraint.qvec12, constraint.tvec12, constraint.rot_weight,
+            constraint.trans_weight);
+
+    problem_->AddResidualBlock(cost_function, loss_function,
+                               image1.Qvec().data(), image1.Tvec().data(),
+                               image2.Qvec().data(), image2.Tvec().data());
   }
 }
 

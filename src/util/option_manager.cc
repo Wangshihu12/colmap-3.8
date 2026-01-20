@@ -543,6 +543,16 @@ void OptionManager::AddMapperOptions() {
                               &mapper->snapshot_images_freq);
   AddAndRegisterDefaultOption("Mapper.fix_existing_images",
                               &mapper->fix_existing_images);
+  AddAndRegisterDefaultOption("Mapper.relative_pose_path",
+                              &mapper->relative_pose_path);
+  AddAndRegisterDefaultOption("Mapper.relative_pose_from_database",
+                              &mapper->relative_pose_from_database);
+  AddAndRegisterDefaultOption("Mapper.relative_pose_rotation_weight",
+                              &mapper->relative_pose_rotation_weight);
+  AddAndRegisterDefaultOption("Mapper.relative_pose_translation_weight",
+                              &mapper->relative_pose_translation_weight);
+  AddAndRegisterDefaultOption("Mapper.normalize_scene",
+                              &mapper->normalize_scene);
 
   // IncrementalMapper.
   AddAndRegisterDefaultOption("Mapper.init_min_num_inliers",

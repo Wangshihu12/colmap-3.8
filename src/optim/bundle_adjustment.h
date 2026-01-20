@@ -34,6 +34,7 @@
 
 #include <memory>
 #include <unordered_set>
+#include <vector>
 
 #include <Eigen/Core>
 
@@ -99,6 +100,15 @@ struct BundleAdjustmentOptions {
   bool Check() const;
 };
 
+struct RelativePoseConstraint {
+  image_t image_id1 = kInvalidImageId;
+  image_t image_id2 = kInvalidImageId;
+  Eigen::Vector4d qvec12 = Eigen::Vector4d::Zero();
+  Eigen::Vector3d tvec12 = Eigen::Vector3d::Zero();
+  double rot_weight = 1.0;
+  double trans_weight = 1.0;
+};
+
 // Configuration container to setup bundle adjustment problems.
 class BundleAdjustmentConfig {
  public:
@@ -111,6 +121,7 @@ class BundleAdjustmentConfig {
   size_t NumConstantTvecs() const;
   size_t NumVariablePoints() const;
   size_t NumConstantPoints() const;
+  size_t NumRelativePoseConstraints() const;
 
   // Determine the number of residuals for the given reconstruction. The number
   // of residuals equals the number of observations times two.
@@ -151,6 +162,10 @@ class BundleAdjustmentConfig {
   void RemoveVariablePoint(const point3D_t point3D_id);
   void RemoveConstantPoint(const point3D_t point3D_id);
 
+  // Add relative pose constraints between image pairs.
+  void AddRelativePoseConstraint(const RelativePoseConstraint& constraint);
+  const std::vector<RelativePoseConstraint>& RelativePoseConstraints() const;
+
   // Access configuration data.
   const std::unordered_set<image_t>& Images() const;
   const std::unordered_set<point3D_t>& VariablePoints() const;
@@ -164,6 +179,7 @@ class BundleAdjustmentConfig {
   std::unordered_set<point3D_t> constant_point3D_ids_;
   std::unordered_set<image_t> constant_poses_;
   std::unordered_map<image_t, std::vector<int>> constant_tvecs_;
+  std::vector<RelativePoseConstraint> relative_pose_constraints_;
 };
 
 // Bundle adjustment based on Ceres-Solver. Enables most flexible configurations
@@ -189,6 +205,8 @@ class BundleAdjuster {
   void AddPointToProblem(const point3D_t point3D_id,
                          Reconstruction* reconstruction,
                          ceres::LossFunction* loss_function);
+  void AddRelativePoseConstraints(Reconstruction* reconstruction,
+                                  ceres::LossFunction* loss_function);
 
  protected:
   void ParameterizeCameras(Reconstruction* reconstruction);

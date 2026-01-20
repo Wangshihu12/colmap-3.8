@@ -267,6 +267,84 @@ class RelativePoseCostFunction {
   const double y2_;
 };
 
+// Cost function for relative pose constraints between two camera poses.
+// The measured relative pose is defined in the coordinate system of the first
+// camera and uses the same world-to-camera convention as qvec/tvec.
+class RelativePoseConstraintCostFunction {
+ public:
+  RelativePoseConstraintCostFunction(const Eigen::Vector4d& qvec_12,
+                                     const Eigen::Vector3d& tvec_12,
+                                     const double rot_weight,
+                                     const double trans_weight)
+      : qvec_12_(qvec_12),
+        tvec_12_(tvec_12),
+        rot_weight_(rot_weight),
+        trans_weight_(trans_weight) {}
+
+  static ceres::CostFunction* Create(const Eigen::Vector4d& qvec_12,
+                                     const Eigen::Vector3d& tvec_12,
+                                     const double rot_weight,
+                                     const double trans_weight) {
+    return (new ceres::AutoDiffCostFunction<
+            RelativePoseConstraintCostFunction, 6, 4, 3, 4, 3>(
+        new RelativePoseConstraintCostFunction(qvec_12, tvec_12, rot_weight,
+                                               trans_weight)));
+  }
+
+  template <typename T>
+  bool operator()(const T* const qvec1, const T* const tvec1,
+                  const T* const qvec2, const T* const tvec2,
+                  T* residuals) const {
+    // Predicted relative rotation: R_12 = R_2 * R_1^T.
+    const T qvec1_inv[4] = {qvec1[0], -qvec1[1], -qvec1[2], -qvec1[3]};
+    T qvec12_pred[4];
+    ceres::QuaternionProduct(qvec2, qvec1_inv, qvec12_pred);
+
+    // Predicted relative translation: t_12 = t_2 - R_12 * t_1.
+    T t1_rot[3];
+    ceres::UnitQuaternionRotatePoint(qvec12_pred, tvec1, t1_rot);
+    T tvec12_pred[3];
+    tvec12_pred[0] = tvec2[0] - t1_rot[0];
+    tvec12_pred[1] = tvec2[1] - t1_rot[1];
+    tvec12_pred[2] = tvec2[2] - t1_rot[2];
+
+    // Rotation error: q_err = q_meas^{-1} * q_pred.
+    const T qvec12_meas[4] = {T(qvec_12_(0)), T(qvec_12_(1)),
+                              T(qvec_12_(2)), T(qvec_12_(3))};
+    const T qvec12_meas_inv[4] = {qvec12_meas[0], -qvec12_meas[1],
+                                  -qvec12_meas[2], -qvec12_meas[3]};
+    T q_err[4];
+    ceres::QuaternionProduct(qvec12_meas_inv, qvec12_pred, q_err);
+    if (q_err[0] < T(0)) {
+      q_err[0] = -q_err[0];
+      q_err[1] = -q_err[1];
+      q_err[2] = -q_err[2];
+      q_err[3] = -q_err[3];
+    }
+
+    T angle_axis[3];
+    ceres::QuaternionToAngleAxis(q_err, angle_axis);
+
+    residuals[0] = T(rot_weight_) * angle_axis[0];
+    residuals[1] = T(rot_weight_) * angle_axis[1];
+    residuals[2] = T(rot_weight_) * angle_axis[2];
+    residuals[3] =
+        T(trans_weight_) * (tvec12_pred[0] - T(tvec_12_(0)));
+    residuals[4] =
+        T(trans_weight_) * (tvec12_pred[1] - T(tvec_12_(1)));
+    residuals[5] =
+        T(trans_weight_) * (tvec12_pred[2] - T(tvec_12_(2)));
+
+    return true;
+  }
+
+ private:
+  const Eigen::Vector4d qvec_12_;
+  const Eigen::Vector3d tvec_12_;
+  const double rot_weight_;
+  const double trans_weight_;
+};
+
 inline void SetQuaternionManifold(ceres::Problem* problem, double* qvec) {
 #if CERES_VERSION_MAJOR >= 2 && CERES_VERSION_MINOR >= 1
   problem->SetManifold(qvec, new ceres::QuaternionManifold);

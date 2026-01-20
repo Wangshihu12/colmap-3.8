@@ -574,6 +574,8 @@ IncrementalMapper::AdjustLocalBundle(
       ba_config.AddImage(local_image_id);
     }
 
+    AddRelativePoseConstraintsToConfig(&ba_config);
+
     // Fix the existing images, if option specified.
     if (options.fix_existing_images) {
       for (const image_t local_image_id : local_bundle) {
@@ -600,15 +602,20 @@ IncrementalMapper::AdjustLocalBundle(
     }
 
     // Fix 7 DOF to avoid scale/rotation/translation drift in bundle adjustment.
+    const bool has_rel_constraints =
+        ba_config.NumRelativePoseConstraints() > 0;
     if (local_bundle.size() == 1) {
       ba_config.SetConstantPose(local_bundle[0]);
-      ba_config.SetConstantTvec(image_id, {0});
+      if (!has_rel_constraints) {
+        ba_config.SetConstantTvec(image_id, {0});
+      }
     } else if (local_bundle.size() > 1) {
       const image_t image_id1 = local_bundle[local_bundle.size() - 1];
       const image_t image_id2 = local_bundle[local_bundle.size() - 2];
       ba_config.SetConstantPose(image_id1);
-      if (!options.fix_existing_images ||
-          !existing_image_ids_.count(image_id2)) {
+      if (!has_rel_constraints &&
+          (!options.fix_existing_images ||
+           !existing_image_ids_.count(image_id2))) {
         ba_config.SetConstantTvec(image_id2, {0});
       }
     }
@@ -684,6 +691,8 @@ bool IncrementalMapper::AdjustGlobalBundle(
     ba_config.AddImage(image_id);
   }
 
+  AddRelativePoseConstraintsToConfig(&ba_config);
+
   // Fix the existing images, if option specified.
   if (options.fix_existing_images) {
     for (const image_t image_id : reg_image_ids) {
@@ -694,9 +703,12 @@ bool IncrementalMapper::AdjustGlobalBundle(
   }
 
   // Fix 7-DOFs of the bundle adjustment problem.
+  const bool has_rel_constraints =
+      ba_config.NumRelativePoseConstraints() > 0;
   ba_config.SetConstantPose(reg_image_ids[0]);
-  if (!options.fix_existing_images ||
-      !existing_image_ids_.count(reg_image_ids[1])) {
+  if (!has_rel_constraints &&
+      (!options.fix_existing_images ||
+       !existing_image_ids_.count(reg_image_ids[1]))) {
     ba_config.SetConstantTvec(reg_image_ids[1], {0});
   }
 
@@ -706,15 +718,17 @@ bool IncrementalMapper::AdjustGlobalBundle(
     return false;
   }
 
-  // Normalize scene for numerical stability and
-  // to avoid large scale changes in viewer.
-  reconstruction_->Normalize();
+  if (options.normalize_scene) {
+    // Normalize scene for numerical stability and
+    // to avoid large scale changes in viewer.
+    reconstruction_->Normalize();
+  }
 
   return true;
 }
 
 bool IncrementalMapper::AdjustParallelGlobalBundle(
-    const BundleAdjustmentOptions& ba_options,
+    const Options& options, const BundleAdjustmentOptions& ba_options,
     const ParallelBundleAdjuster::Options& parallel_ba_options) {
   CHECK_NOTNULL(reconstruction_);
 
@@ -739,9 +753,11 @@ bool IncrementalMapper::AdjustParallelGlobalBundle(
     return false;
   }
 
-  // Normalize scene for numerical stability and
-  // to avoid large scale changes in viewer.
-  reconstruction_->Normalize();
+  if (options.normalize_scene) {
+    // Normalize scene for numerical stability and
+    // to avoid large scale changes in viewer.
+    reconstruction_->Normalize();
+  }
 
   return true;
 }
@@ -796,6 +812,25 @@ const std::unordered_set<point3D_t>& IncrementalMapper::GetModifiedPoints3D() {
 
 void IncrementalMapper::ClearModifiedPoints3D() {
   triangulator_->ClearModifiedPoints3D();
+}
+
+void IncrementalMapper::SetRelativePoseConstraints(
+    const std::vector<RelativePoseConstraint>& constraints) {
+  relative_pose_constraints_ = constraints;
+}
+
+void IncrementalMapper::AddRelativePoseConstraintsToConfig(
+    BundleAdjustmentConfig* config) const {
+  if (relative_pose_constraints_.empty()) {
+    return;
+  }
+
+  for (const auto& constraint : relative_pose_constraints_) {
+    if (config->HasImage(constraint.image_id1) &&
+        config->HasImage(constraint.image_id2)) {
+      config->AddRelativePoseConstraint(constraint);
+    }
+  }
 }
 
 std::vector<image_t> IncrementalMapper::FindFirstInitialImage(
