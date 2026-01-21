@@ -730,7 +730,7 @@ int RunRigBundleAdjuster(int argc, char** argv) {
   PrintHeading1("Rig bundle adjustment");
 
   BundleAdjustmentOptions ba_options = *options.bundle_adjustment;
-  ba_options.solver_options.minimizer_progress_to_stdout = true;
+  ba_options.solver_options.minimizer_progress_to_stdout = false;
   RigBundleAdjuster bundle_adjuster(ba_options, rig_ba_options, config);
   CHECK(bundle_adjuster.Solve(&reconstruction, &camera_rigs));
 

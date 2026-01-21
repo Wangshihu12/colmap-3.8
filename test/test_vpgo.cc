@@ -15,7 +15,7 @@
 
 #include "util/misc.h"
 #include "util/string.h"
-#include "xgbase/utils.h"
+// #include "xgbase/utils.h"
 
 using namespace colmap;
 
@@ -23,27 +23,27 @@ using namespace colmap;
 #include <boost/property_tree/ptree.hpp>
 #include <chrono>
 #ifdef _WIN32
-#include <json/json.h>
+// #include <json/json.h>
 #else
-#include "json.h"
+// #include "json.h"
 #endif
 
-#include "lixel/lidar_post_process.h"
+// #include "lixel/lidar_post_process.h"
 
 #ifdef AUTHENTICATE_KEY
 #include <md5/include/XGrids/Base/MD5.h>
 #endif
 
 #include "base/cost_functions.h"
-#include "base/lcc_errocde.h"
-#include "base/memory_instruction.hpp"
-#include "xgbase/lcc_config.h"
-#include "xgbase/lcc_config_device.h"
+// #include "base/lcc_errocde.h"
+// #include "base/memory_instruction.hpp"
+// #include "xgbase/lcc_config.h"
+// #include "xgbase/lcc_config_device.h"
 
 #include <ceres/ceres.h>
-#include <ceres/manifold.h>
+#include <ceres/local_parameterization.h>
 
-using namespace xgrids3d;
+// using namespace xgrids3d;
 using namespace colmap;
 
 struct SE3RelativePoseCost {

@@ -82,7 +82,7 @@ void BundleAdjustmentController::Run() {
   reconstruction_->FilterObservationsWithNegativeDepth();
 
   BundleAdjustmentOptions ba_options = *options_.bundle_adjustment;
-  ba_options.solver_options.minimizer_progress_to_stdout = true;
+  ba_options.solver_options.minimizer_progress_to_stdout = false;
 
   BundleAdjustmentIterationCallback iteration_callback(this);
   ba_options.solver_options.callbacks.push_back(&iteration_callback);

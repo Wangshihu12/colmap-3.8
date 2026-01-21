@@ -88,6 +88,7 @@ if(OPENMP_ENABLED)
     find_package(OpenMP QUIET)
 endif()
 
+set(Ceres_DIR /usr/local/Ceres-2.1.0/lib/cmake/Ceres)
 find_package(Ceres REQUIRED)
 
 find_package(Boost REQUIRED COMPONENTS
@@ -416,6 +417,7 @@ link_directories(${COLMAP_LINK_DIRS})
 
 add_subdirectory(lib)
 add_subdirectory(src)
+add_subdirectory(test)
 
 
 ################################################################################
