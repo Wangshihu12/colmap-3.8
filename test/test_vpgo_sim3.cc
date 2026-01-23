@@ -30,9 +30,7 @@ using namespace colmap;
 #include <chrono>
 #include <algorithm>
 #include <cmath>
-#include <fstream>
 #include <numeric>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #ifdef _WIN32
@@ -119,45 +117,6 @@ struct SE3RelativePoseCost {
   double trans_weight_;
 };
 
-bool ParseLoopEdgeMeasurement(const std::string& line, image_t* image_id1,
-                              image_t* image_id2, Eigen::Quaterniond* q_ij,
-                              Eigen::Vector3d* t_ij_dir) {
-  std::string content = line;
-  const auto comment_pos = content.find('#');
-  if (comment_pos != std::string::npos) {
-    content = content.substr(0, comment_pos);
-  }
-  StringTrim(&content);
-  if (content.empty()) {
-    return false;
-  }
-
-  std::istringstream iss(content);
-  int64_t id1 = -1;
-  int64_t id2 = -1;
-  double qw = 0.0;
-  double qx = 0.0;
-  double qy = 0.0;
-  double qz = 0.0;
-  double tx = 0.0;
-  double ty = 0.0;
-  double tz = 0.0;
-  if (!(iss >> id1 >> id2 >> qw >> qx >> qy >> qz >> tx >> ty >> tz)) {
-    return false;
-  }
-
-  *image_id1 = static_cast<image_t>(id1);
-  *image_id2 = static_cast<image_t>(id2);
-  *q_ij = Eigen::Quaterniond(qw, qx, qy, qz);
-  q_ij->normalize();
-  *t_ij_dir = Eigen::Vector3d(tx, ty, tz);
-  const double t_norm = t_ij_dir->norm();
-  if (t_norm > 1e-12) {
-    *t_ij_dir /= t_norm;
-  }
-  return true;
-}
-
 struct SE3RelativePoseCostFull {
   SE3RelativePoseCostFull(const Eigen::Quaterniond& q_ij,
                           const Eigen::Vector3d& t_ij, double rot_weight,
@@ -216,20 +175,97 @@ struct SE3RelativePoseCostFull {
   double trans_weight_;
 };
 
-class SE3Manifold : public ceres::Manifold {
+struct Sim3RelativePoseCost {
+  Sim3RelativePoseCost(const Eigen::Quaterniond& q_ij,
+                       const Eigen::Vector3d& t_ij_dir,
+                       const double t_ij_scale, const double rot_weight,
+                       const double trans_weight, const double scale_weight)
+      : q_ij_(q_ij),
+        t_ij_dir_(t_ij_dir),
+        t_ij_scale_(t_ij_scale),
+        rot_weight_(rot_weight),
+        trans_weight_(trans_weight),
+        scale_weight_(scale_weight) {}
+
+  template <typename T>
+  bool operator()(const T* const pose_i, const T* const pose_j,
+                  T* residuals) const {
+    // 位姿参数： [qw qx qy qz tx ty tz s]
+    Eigen::Quaternion<T> q_i(pose_i[0], pose_i[1], pose_i[2], pose_i[3]);
+    Eigen::Matrix<T, 3, 1> t_i(pose_i[4], pose_i[5], pose_i[6]);
+    const T s_i = pose_i[7];
+
+    Eigen::Quaternion<T> q_j(pose_j[0], pose_j[1], pose_j[2], pose_j[3]);
+    Eigen::Matrix<T, 3, 1> t_j(pose_j[4], pose_j[5], pose_j[6]);
+    const T s_j = pose_j[7];
+
+    const Eigen::Quaternion<T> q_ij = q_ij_.cast<T>();
+    const Eigen::Matrix<T, 3, 1> t_ij_dir = t_ij_dir_.cast<T>();
+    const T t_ij_scale = T(t_ij_scale_);
+    const Eigen::Matrix<T, 3, 1> t_ij_obs = t_ij_dir * t_ij_scale;
+
+    // 预测相对旋转
+    Eigen::Quaternion<T> q_ij_pred = q_j * q_i.conjugate();
+    Eigen::Quaternion<T> dq = q_ij.conjugate() * q_ij_pred;
+
+    Eigen::Matrix<T, 3, 1> r_rot;
+    r_rot << T(2) * dq.x(), T(2) * dq.y(), T(2) * dq.z();
+
+    // 预测相对平移（包含尺度比例）
+    const T s_ij = s_j / s_i;
+    Eigen::Matrix<T, 3, 1> t_pred = t_j - s_ij * (q_ij_pred * t_i);
+    // 直接约束完整平移向量（由方向 + 尺度构成）
+    Eigen::Matrix<T, 3, 1> r_trans = t_pred - t_ij_obs;
+    // 额外尺度残差：约束平移长度
+    const T r_scale = t_pred.norm() - t_ij_scale;
+
+    residuals[0] = T(rot_weight_) * r_rot(0);
+    residuals[1] = T(rot_weight_) * r_rot(1);
+    residuals[2] = T(rot_weight_) * r_rot(2);
+    residuals[3] = T(trans_weight_) * r_trans(0);
+    residuals[4] = T(trans_weight_) * r_trans(1);
+    residuals[5] = T(trans_weight_) * r_trans(2);
+    residuals[6] = T(scale_weight_) * r_scale;
+
+    return true;
+  }
+
+  static ceres::CostFunction* Create(const Eigen::Quaterniond& q_ij,
+                                     const Eigen::Vector3d& t_ij_dir,
+                                     const double t_ij_scale,
+                                     const double rot_weight,
+                                     const double trans_weight,
+                                     const double scale_weight) {
+    return new ceres::AutoDiffCostFunction<Sim3RelativePoseCost, 7, 8, 8>(
+        new Sim3RelativePoseCost(q_ij, t_ij_dir, t_ij_scale, rot_weight,
+                                 trans_weight, scale_weight));
+  }
+
+ private:
+  Eigen::Quaterniond q_ij_;
+  Eigen::Vector3d t_ij_dir_;
+  double t_ij_scale_;
+  double rot_weight_;
+  double trans_weight_;
+  double scale_weight_;
+};
+
+class Sim3Manifold : public ceres::Manifold {
  public:
-  int AmbientSize() const override { return 7; }
-  int TangentSize() const override { return 6; }
+  int AmbientSize() const override { return 8; }
+  int TangentSize() const override { return 7; }
 
   // x_plus_delta = x ⊕ delta（李代数增量更新）
   bool Plus(const double* x, const double* delta,
             double* x_plus_delta) const override {
-    // 位姿参数： [qw qx qy qz tx ty tz]
+    // 位姿参数： [qw qx qy qz tx ty tz s]
     Eigen::Quaterniond q(x[0], x[1], x[2], x[3]);
     Eigen::Vector3d t(x[4], x[5], x[6]);
+    const double s = x[7];
 
     Eigen::Vector3d omega(delta[0], delta[1], delta[2]);
     Eigen::Vector3d upsilon(delta[3], delta[4], delta[5]);
+    const double sigma = delta[6];
 
     double theta = omega.norm();
     Eigen::Quaterniond dq = Eigen::Quaterniond::Identity();
@@ -239,6 +275,7 @@ class SE3Manifold : public ceres::Manifold {
 
     Eigen::Quaterniond q_new = (dq * q).normalized();
     Eigen::Vector3d t_new = t + upsilon;
+    const double s_new = s * std::exp(sigma);
 
     x_plus_delta[0] = q_new.w();
     x_plus_delta[1] = q_new.x();
@@ -247,14 +284,16 @@ class SE3Manifold : public ceres::Manifold {
     x_plus_delta[4] = t_new.x();
     x_plus_delta[5] = t_new.y();
     x_plus_delta[6] = t_new.z();
+    x_plus_delta[7] = s_new;
 
     return true;
   }
 
   bool PlusJacobian(const double*, double* jacobian) const override {
-    Eigen::Map<Eigen::Matrix<double, 7, 6, Eigen::RowMajor>> J(jacobian);
+    Eigen::Map<Eigen::Matrix<double, 8, 7, Eigen::RowMajor>> J(jacobian);
     J.setZero();
     J.block<6, 6>(1, 0).setIdentity();
+    J(7, 6) = 1.0;
     return true;
   }
 
@@ -265,12 +304,15 @@ class SE3Manifold : public ceres::Manifold {
     Eigen::Quaterniond qy(y[0], y[1], y[2], y[3]);
     Eigen::Vector3d tx(x[4], x[5], x[6]);
     Eigen::Vector3d ty(y[4], y[5], y[6]);
+    const double sx = x[7];
+    const double sy = y[7];
 
     Eigen::Quaterniond dq = qy * qx.conjugate();
     Eigen::AngleAxisd aa(dq);
 
     Eigen::Vector3d omega = aa.axis() * aa.angle();
     Eigen::Vector3d upsilon = ty - tx;
+    const double sigma = std::log(sy / sx);
 
     y_minus_x[0] = omega.x();
     y_minus_x[1] = omega.y();
@@ -278,14 +320,16 @@ class SE3Manifold : public ceres::Manifold {
     y_minus_x[3] = upsilon.x();
     y_minus_x[4] = upsilon.y();
     y_minus_x[5] = upsilon.z();
+    y_minus_x[6] = sigma;
 
     return true;
   }
 
   bool MinusJacobian(const double*, double* jacobian) const override {
-    Eigen::Map<Eigen::Matrix<double, 6, 7, Eigen::RowMajor>> J(jacobian);
+    Eigen::Map<Eigen::Matrix<double, 7, 8, Eigen::RowMajor>> J(jacobian);
     J.setZero();
     J.block<6, 6>(0, 1).setIdentity();
+    J(6, 7) = 1.0;
     return true;
   }
 };
@@ -475,14 +519,6 @@ int main(int argc, char** argv) {
   std::string sparse_path = argv[1];    // 稀疏重建结果路径
   std::string database_path = argv[2];  // COLMAP数据库路径
   std::string output_path = argv[3];    // 优化后的输出路径
-  CreateDirIfNotExists(output_path);
-
-  const std::string loop_edges_path = JoinPaths(output_path, "loop_edges.txt");
-  std::ofstream loop_edges_file(loop_edges_path);
-  if (!loop_edges_file.is_open()) {
-    std::cout << "WARNING: Could not open loop edge output file at "
-              << loop_edges_path << std::endl;
-  }
 
   // 读取稀疏重建结果
   Reconstruction reconstruction;
@@ -502,8 +538,8 @@ int main(int argc, char** argv) {
   // 遍历所有图像，初始化位姿参数
   for (const auto image_id : reconstruction.RegImageIds()) {
     const Image& image = reconstruction.Image(image_id);
-    // 分配7维位姿参数：4维四元数（qw, qx, qy, qz）+ 3维平移（tx, ty, tz）
-    double* pose = new double[7];
+    // 分配8维位姿参数：4维四元数 + 3维平移 + 1维尺度
+    double* pose = new double[8];
 
     // 获取图像的旋转四元数和平移向量
     const auto Q = image.Qvec();  // 四元数，形状为(4,)
@@ -518,13 +554,15 @@ int main(int argc, char** argv) {
     pose[4] = T[0];  // tx
     pose[5] = T[1];  // ty
     pose[6] = T[2];  // tz
+    // 初始化尺度为1（保持与原重建尺度一致）
+    pose[7] = 1.0;
 
     // 存储位姿参数指针
     pose_params[image.ImageId()] = pose;
 
     // 将位姿参数块添加到优化问题中
-    // 使用SE3流形确保四元数的单位性约束和正确的切空间参数化
-    problem.AddParameterBlock(pose, 7, new SE3Manifold());
+    // 使用Sim3流形保证四元数单位性与尺度正值
+    problem.AddParameterBlock(pose, 8, new Sim3Manifold());
   }
 
   // ----------------------------
@@ -584,13 +622,16 @@ int main(int argc, char** argv) {
       const Eigen::Quaterniond q_ij(qvec_ij(0), qvec_ij(1), qvec_ij(2),
                                     qvec_ij(3));
       const Eigen::Vector3d t_ij = tvec_ij;
-      const Eigen::Vector3d t_ij_dir = t_ij.normalized();
+      const double t_ij_scale = t_ij.norm();
+      if (t_ij_scale <= 1e-12) {
+        continue;
+      }
+      const Eigen::Vector3d t_ij_dir = t_ij / t_ij_scale;
 
-      // 序列边使用完整平移约束，避免尺度漂移
-      ceres::CostFunction* cost = SE3RelativePoseCostFull::Create(
-          q_ij, t_ij, 1.0, 1.0);
-      // ceres::CostFunction* cost = SE3RelativePoseCost::Create(
-      //     q_ij, t_ij_dir, 1.0, 1.0);
+      // 序列边使用Sim3约束：方向 + 尺度构成完整平移，并强化尺度残差
+      const double scale_weight = 1.0;
+      ceres::CostFunction* cost = Sim3RelativePoseCost::Create(
+          q_ij, t_ij_dir, t_ij_scale, 1.0, 1.0, scale_weight);
       problem.AddResidualBlock(cost, nullptr, pose_params[image_id_i],
                                pose_params[image_id_j]);
       sequential_pairs.insert(
@@ -622,13 +663,9 @@ int main(int argc, char** argv) {
   const size_t kMaxLoopEdgesPerImage = 30;
   std::unordered_map<image_t, size_t> loop_degree;
   loop_degree.reserve(reconstruction.RegImageIds().size());
-  std::unordered_set<image_pair_t> loop_pairs;
-  loop_pairs.reserve(reconstruction.RegImageIds().size());
 
   const double max_error_px = 4.0;
   const double min_inlier_ratio = 0.2;
-  const double loop_rot_weight = 5.0;
-  const double loop_trans_weight = 2.0;
 
   for (const size_t idx : loop_indices) {
     image_t i;
@@ -696,6 +733,7 @@ int main(int argc, char** argv) {
 
     Eigen::Quaterniond q_ij;
     Eigen::Vector3d t_ij_dir;
+    double t_ij_scale = 0.0;
     if (geom.qvec.squaredNorm() > 1e-12 && geom.tvec.squaredNorm() > 1e-12) {
       // 数据库中已有相对位姿，直接使用
       const Eigen::Vector4d normalized_qvec =
@@ -711,6 +749,16 @@ int main(int argc, char** argv) {
         continue;
       }
     }
+
+    // 使用重建中两相机中心的距离作为回环尺度
+    const Eigen::Vector3d center_i =
+        ProjectionCenterFromPose(image_i.Qvec(), image_i.Tvec());
+    const Eigen::Vector3d center_j =
+        ProjectionCenterFromPose(image_j.Qvec(), image_j.Tvec());
+    t_ij_scale = (center_j - center_i).norm();
+    if (t_ij_scale <= 1e-12) {
+      continue;
+    }
     // std::cout << "q_ij: " << q_ij.w() << " " << q_ij.x() << " " << q_ij.y() << " " << q_ij.z() << std::endl;
     // std::cout << "t_ij_dir: " << t_ij_dir.transpose() << std::endl;
 
@@ -722,9 +770,11 @@ int main(int argc, char** argv) {
         (geom.tri_angle > 0) ? std::min(2.0, geom.tri_angle / min_tri_angle)
                              : 1.0;
     // const double rot_weight = 5.0 * inlier_scale * tri_scale;
-    const double rot_weight = loop_rot_weight;
+    const double rot_weight = 5.0;
     // const double trans_weight = 2.0 * inlier_scale * tri_scale;
-    const double trans_weight = loop_trans_weight;
+    const double trans_weight = 1.0;
+    // 回环边尺度不确定，尺度残差权重设置为较小值
+    const double scale_weight = 0.1;
 
     // 稀疏度控制：限制每张图像参与的回环边数量
     if (loop_degree[i] >= kMaxLoopEdgesPerImage ||
@@ -732,71 +782,14 @@ int main(int argc, char** argv) {
       continue;
     }
 
-    ceres::CostFunction* cost = SE3RelativePoseCost::Create(
-        q_ij, t_ij_dir, rot_weight, trans_weight);
+    ceres::CostFunction* cost = Sim3RelativePoseCost::Create(
+        q_ij, t_ij_dir, t_ij_scale, rot_weight, trans_weight, scale_weight);
     // 回环边加入Huber鲁棒核，降低误匹配的影响
     problem.AddResidualBlock(cost, new ceres::HuberLoss(1.0), pose_params[i],
                              pose_params[j]);
-    if (loop_edges_file.is_open()) {
-      loop_edges_file << i << " " << j << " " << q_ij.w() << " " << q_ij.x()
-                      << " " << q_ij.y() << " " << q_ij.z() << " "
-                      << t_ij_dir(0) << " " << t_ij_dir(1) << " "
-                      << t_ij_dir(2) << "\n";
-    }
-    loop_pairs.insert(pair_id);
     loop_degree[i] += 1;
     loop_degree[j] += 1;
     num_loop++;
-  }
-
-  // ----------------------------
-  // 手动添加回环边（从 loop_edges_gt.txt 读取）
-  // ----------------------------
-  const std::string loop_edges_gt_path =
-      JoinPaths(output_path, "loop_edges_gt.txt");
-  if (ExistsFile(loop_edges_gt_path)) {
-    std::ifstream loop_edges_gt_file(loop_edges_gt_path);
-    if (!loop_edges_gt_file.is_open()) {
-      std::cout << "WARNING: Could not open loop edges file at "
-                << loop_edges_gt_path << std::endl;
-    } else {
-      size_t num_manual_loops = 0;
-      std::string line;
-      while (std::getline(loop_edges_gt_file, line)) {
-        image_t i = kInvalidImageId;
-        image_t j = kInvalidImageId;
-        Eigen::Quaterniond q_ij;
-        Eigen::Vector3d t_ij_dir;
-        if (!ParseLoopEdgeMeasurement(line, &i, &j, &q_ij, &t_ij_dir)) {
-          continue;
-        }
-
-        if (pose_params.find(i) == pose_params.end() ||
-            pose_params.find(j) == pose_params.end()) {
-          continue;
-        }
-
-        const image_pair_t pair_id = Database::ImagePairToPairId(i, j);
-        if (sequential_pairs.count(pair_id) > 0 ||
-            loop_pairs.count(pair_id) > 0) {
-          continue;
-        }
-
-        ceres::CostFunction* cost = SE3RelativePoseCost::Create(
-            q_ij, t_ij_dir, loop_rot_weight, loop_trans_weight);
-        problem.AddResidualBlock(cost, new ceres::HuberLoss(1.0),
-                                 pose_params[i], pose_params[j]);
-        loop_pairs.insert(pair_id);
-        loop_degree[i] += 1;
-        loop_degree[j] += 1;
-        num_loop++;
-        num_manual_loops++;
-      }
-
-      if (num_manual_loops > 0) {
-        std::cout << "Added manual loop edges: " << num_manual_loops << "\n";
-      }
-    }
   }
 
   // ----------------------------
@@ -813,16 +806,9 @@ int main(int argc, char** argv) {
   // 求解位姿图优化问题
   // ----------------------------
   ceres::Solver::Options options;
-  // 位姿图优化更适合直接稀疏分解
-  options.linear_solver_type = ceres::SPARSE_SCHUR;
-  options.max_num_iterations = 200;            // 允许更多迭代以收敛回环
-  options.function_tolerance = 1e-6;
-  options.gradient_tolerance = 1e-10;
-  options.parameter_tolerance = 1e-8;
-  const int num_threads = 6;
-  options.num_threads = num_threads;
-  // options.num_linear_solver_threads = num_threads;
-  options.minimizer_progress_to_stdout = true;  // 输出优化进度
+  options.linear_solver_type = ceres::SPARSE_SCHUR;  // 使用稀疏Schur求解器
+  options.max_num_iterations = 100;                   // 最大迭代次数
+  options.minimizer_progress_to_stdout = true;        // 输出优化进度
 
   ceres::Solver::Summary summary;
   ceres::Solve(options, &problem, &summary);
@@ -839,10 +825,17 @@ int main(int argc, char** argv) {
     // 从优化结果中提取四元数和平移
     Eigen::Quaterniond q(pose[0], pose[1], pose[2], pose[3]);
     Eigen::Vector3d t(pose[4], pose[5], pose[6]);
+    const double s = pose[7];
+
+    // Sim3转换为SE3：保持相机中心一致，将平移按尺度归一化
+    Eigen::Vector3d t_se3 = t;
+    if (s > 1e-12) {
+      t_se3 = t / s;
+    }
 
     // 将优化后的位姿写回图像对象
     image.SetQvec(Eigen::Vector4d(q.w(), q.x(), q.y(), q.z()));
-    image.SetTvec(t);
+    image.SetTvec(t_se3);
   }
 
   // // ----------------------------
