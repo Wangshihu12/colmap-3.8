@@ -35,6 +35,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <unordered_map>
 
 #include "base/pose.h"
 #include "util/misc.h"
@@ -359,15 +360,9 @@ std::vector<RelativePoseConstraint> ReadRelativePoseConstraints(
 std::vector<RelativePoseConstraint> BuildRelativePoseConstraintsFromDatabase(
     const DatabaseCache& database_cache, const double default_rot_weight,
     const double default_trans_weight) {
-  struct ImageStamp {
-    image_t image_id;
-    int64_t timestamp;
-  };
+  std::unordered_map<camera_t, std::vector<image_t>> camera_image_ids;
+  camera_image_ids.reserve(database_cache.NumImages());
 
-  std::vector<ImageStamp> ordered_images;
-  ordered_images.reserve(database_cache.NumImages());
-
-  size_t num_missing_timestamp = 0;
   size_t num_missing_priors = 0;
 
   for (const auto& image_pair : database_cache.Images()) {
@@ -377,52 +372,38 @@ std::vector<RelativePoseConstraint> BuildRelativePoseConstraintsFromDatabase(
       continue;
     }
 
-    int64_t timestamp = 0;
-    if (!TryExtractTimestampFromName(image.Name(), &timestamp)) {
-      num_missing_timestamp += 1;
-      continue;
-    }
-
-    ordered_images.push_back({image.ImageId(), timestamp});
+    camera_image_ids[image.CameraId()].push_back(image.ImageId());
   }
-
-  std::sort(ordered_images.begin(), ordered_images.end(),
-            [](const ImageStamp& a, const ImageStamp& b) {
-              if (a.timestamp == b.timestamp) {
-                return a.image_id < b.image_id;
-              }
-              return a.timestamp < b.timestamp;
-            });
 
   if (num_missing_priors > 0) {
     std::cout << "WARNING: " << num_missing_priors
               << " images missing pose priors; skipped." << std::endl;
   }
-  if (num_missing_timestamp > 0) {
-    std::cout << "WARNING: " << num_missing_timestamp
-              << " images missing timestamp in name; skipped." << std::endl;
-  }
 
   std::vector<RelativePoseConstraint> constraints;
-  if (ordered_images.size() < 2) {
-    return constraints;
-  }
+  for (auto& pair : camera_image_ids) {
+    auto& image_ids = pair.second;
+    if (image_ids.size() < 2) {
+      continue;
+    }
+    std::sort(image_ids.begin(), image_ids.end());
+    constraints.reserve(constraints.size() + image_ids.size() - 1);
 
-  constraints.reserve(ordered_images.size() - 1);
-  for (size_t i = 0; i + 1 < ordered_images.size(); ++i) {
-    const Image& image1 = database_cache.Image(ordered_images[i].image_id);
-    const Image& image2 = database_cache.Image(ordered_images[i + 1].image_id);
+    for (size_t i = 0; i + 1 < image_ids.size(); ++i) {
+      const Image& image1 = database_cache.Image(image_ids[i]);
+      const Image& image2 = database_cache.Image(image_ids[i + 1]);
 
-    RelativePoseConstraint constraint;
-    constraint.image_id1 = image1.ImageId();
-    constraint.image_id2 = image2.ImageId();
-    ComputeRelativePose(image1.QvecPrior(), image1.TvecPrior(),
-                        image2.QvecPrior(), image2.TvecPrior(),
-                        &constraint.qvec12, &constraint.tvec12);
-    constraint.qvec12 = NormalizeQuaternion(constraint.qvec12);
-    constraint.rot_weight = default_rot_weight;
-    constraint.trans_weight = default_trans_weight;
-    constraints.push_back(constraint);
+      RelativePoseConstraint constraint;
+      constraint.image_id1 = image1.ImageId();
+      constraint.image_id2 = image2.ImageId();
+      ComputeRelativePose(image1.QvecPrior(), image1.TvecPrior(),
+                          image2.QvecPrior(), image2.TvecPrior(),
+                          &constraint.qvec12, &constraint.tvec12);
+      constraint.qvec12 = NormalizeQuaternion(constraint.qvec12);
+      constraint.rot_weight = default_rot_weight;
+      constraint.trans_weight = default_trans_weight;
+      constraints.push_back(constraint);
+    }
   }
 
   return constraints;

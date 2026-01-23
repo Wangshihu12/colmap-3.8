@@ -139,8 +139,8 @@ struct IncrementalMapperOptions {
   // Path to relative pose constraints for bundle adjustment.
   std::string relative_pose_path;
   bool relative_pose_from_database = true;
-  double relative_pose_rotation_weight = 1.0;
-  double relative_pose_translation_weight = 10.0;
+  double relative_pose_rotation_weight = 0.1;
+  double relative_pose_translation_weight = 1.0;
 
   // Normalize the scene after global bundle adjustment.
   bool normalize_scene = false;

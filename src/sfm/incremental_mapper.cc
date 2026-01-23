@@ -34,6 +34,7 @@
 #include <array>
 #include <fstream>
 
+#include "base/pose.h"
 #include "base/projection.h"
 #include "base/triangulation.h"
 #include "estimators/pose.h"
