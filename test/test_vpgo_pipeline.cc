@@ -339,7 +339,8 @@ bool ParseEdgeLine(const std::string& line, const EdgeDefaults& defaults,
   if (parsed.q_ij.norm() > 1e-12) {
     parsed.q_ij.normalize();
   }
-  parsed.t_ij = Eigen::Vector3d(tx, ty, tz);
+  Eigen::Vector3d t_ij = Eigen::Vector3d(tx, ty, tz);
+  parsed.t_ij = t_ij.normalized();  // 需要归一化，因为 loop_edges_gt.txt 中记录的平移是原始向量，没有归一化
 
   // 根据边类型设置默认权重参数
   if (parsed.type == EdgeType::kOdom) {
@@ -753,6 +754,8 @@ std::vector<PoseGraphEdge> BuildOdometryEdges(
       Eigen::Vector3d tvec_ij;
       ComputeRelativePose(image_i.Qvec(), image_i.Tvec(), image_j.Qvec(),
                           image_j.Tvec(), &qvec_ij, &tvec_ij);
+      
+      Eigen::Vector3d tvec_ij_dir = tvec_ij.normalized();
 
       // 构建里程计边
       PoseGraphEdge edge;
@@ -761,7 +764,11 @@ std::vector<PoseGraphEdge> BuildOdometryEdges(
       edge.image_id2 = image_id_j;
       edge.q_ij = Eigen::Quaterniond(qvec_ij(0), qvec_ij(1), qvec_ij(2),
                                      qvec_ij(3));
-      edge.t_ij = tvec_ij;
+      if (defaults.odom_translation_is_unit) {
+        edge.t_ij = tvec_ij_dir;
+      } else {
+        edge.t_ij = tvec_ij;
+      }
       edge.translation_is_unit = defaults.odom_translation_is_unit;
       edge.rot_weight = defaults.odom_rot_weight;
       edge.trans_weight = defaults.odom_trans_weight;
@@ -769,6 +776,69 @@ std::vector<PoseGraphEdge> BuildOdometryEdges(
     }
   }
 
+  return edges;
+}
+
+std::vector<PoseGraphEdge> BuildOdometryEdges(
+    const Reconstruction& reconstruction, Database* database,
+    const EdgeDefaults& defaults) {
+  // 从数据库读取所有两视图几何
+  std::vector<image_pair_t> image_pair_ids;
+  std::vector<TwoViewGeometry> two_view_geometries;
+  database->ReadTwoViewGeometries(&image_pair_ids, &two_view_geometries);
+
+  std::vector<PoseGraphEdge> edges;
+
+  // 遍历所有图像对
+  for (size_t idx = 0; idx < image_pair_ids.size(); ++idx) {
+    image_t i;
+    image_t j;
+    Database::PairIdToImagePair(image_pair_ids[idx], &i, &j);
+    (void)two_view_geometries[idx];
+
+    // 跳过id间隔大于10的图像对
+    if (std::abs(static_cast<int>(i) - static_cast<int>(j)) > 10) {
+      continue;
+    }
+
+    // 图像必须存在于重建中
+    if (!reconstruction.ExistsImage(i) || !reconstruction.ExistsImage(j)) {
+      continue;
+    }
+
+    // 构建里程计边
+    const Image& image_i = reconstruction.Image(i);
+    const Image& image_j = reconstruction.Image(j);
+
+    // 计算相对位姿（从i到j的变换）
+    Eigen::Vector4d qvec_ij;
+    Eigen::Vector3d tvec_ij;
+    ComputeRelativePose(image_i.Qvec(), image_i.Tvec(), image_j.Qvec(),
+                        image_j.Tvec(), &qvec_ij, &tvec_ij);
+    
+    Eigen::Vector3d tvec_ij_dir = tvec_ij;
+    const double t_norm = tvec_ij_dir.norm();
+    if (t_norm > 1e-12) {
+      tvec_ij_dir /= t_norm;
+    }
+
+    // 构建里程计边
+    PoseGraphEdge edge;
+    edge.type = EdgeType::kOdom;
+    edge.image_id1 = i;
+    edge.image_id2 = j;
+    edge.q_ij = Eigen::Quaterniond(qvec_ij(0), qvec_ij(1), qvec_ij(2),
+                                    qvec_ij(3));
+    if (defaults.odom_translation_is_unit) {
+      edge.t_ij = tvec_ij_dir;
+    } else {
+      edge.t_ij = tvec_ij;
+    }
+    edge.translation_is_unit = defaults.odom_translation_is_unit;
+    edge.rot_weight = defaults.odom_rot_weight;
+    edge.trans_weight = defaults.odom_trans_weight;
+    edges.push_back(edge);
+  }
   return edges;
 }
 
@@ -1266,7 +1336,8 @@ int main(int argc, char** argv) {
   } else {
     // 自动构建里程计边
     if (options.build_odom_edges) {
-      auto odom_edges = BuildOdometryEdges(reconstruction, options.defaults);
+      // auto odom_edges = BuildOdometryEdges(reconstruction, options.defaults);
+      auto odom_edges = BuildOdometryEdges(reconstruction, &database, options.defaults);
       for (const auto& edge : odom_edges) {
         const image_pair_t pair_id =
             Database::ImagePairToPairId(edge.image_id1, edge.image_id2);
