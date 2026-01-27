@@ -37,6 +37,8 @@
 
 #include <QOpenGLFunctions_3_2_Core>
 
+#include <string>
+
 #include "base/database.h"
 #include "base/reconstruction.h"
 #include "ui/colormaps.h"
@@ -84,6 +86,10 @@ class ModelViewerWidget : public QOpenGLWidget,
   // Takes ownwership of the colormap objects.
   void SetPointColormap(PointColormapBase* colormap);
   void SetImageColormap(ImageColormapBase* colormap);
+
+  bool LoadLoopEdges(const std::string& path, size_t* num_loaded,
+                     size_t* num_skipped);
+  void ClearLoopEdges();
 
   void UpdateMovieGrabber();
 
@@ -150,6 +156,7 @@ class ModelViewerWidget : public QOpenGLWidget,
   void UploadPointConnectionData();
   void UploadImageData(const bool selection_mode = false);
   void UploadImageConnectionData();
+  void UploadLoopEdgeData();
   void UploadMovieGrabberData();
 
   void ComposeProjectionMatrix();
@@ -174,6 +181,7 @@ class ModelViewerWidget : public QOpenGLWidget,
   LinePainter image_line_painter_;
   TrianglePainter image_triangle_painter_;
   LinePainter image_connection_painter_;
+  LinePainter loop_edge_painter_;
 
   LinePainter movie_grabber_path_painter_;
   LinePainter movie_grabber_line_painter_;
@@ -196,6 +204,8 @@ class ModelViewerWidget : public QOpenGLWidget,
   image_t selected_image_id_;
   point3D_t selected_point3D_id_;
   size_t selected_movie_grabber_view_;
+
+  std::vector<std::pair<image_t, image_t>> loop_edges_;
 
   bool coordinate_grid_enabled_;
 

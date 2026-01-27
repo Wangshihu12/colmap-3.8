@@ -86,6 +86,7 @@ class MainWindow : public QMainWindow {
   void ProjectSaveAs();
   void Import();
   void ImportFrom();
+  void ImportLoopEdges();
   void Export();
   void ExportAll();
   void ExportAs();
@@ -187,6 +188,7 @@ class MainWindow : public QMainWindow {
   QAction* action_project_save_as_;
   QAction* action_import_;
   QAction* action_import_from_;
+  QAction* action_import_loop_edges_;
   QAction* action_export_;
   QAction* action_export_all_;
   QAction* action_export_as_;

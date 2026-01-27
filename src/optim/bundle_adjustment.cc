@@ -510,9 +510,8 @@ void BundleAdjuster::AddRelativePoseConstraints(
     image2.NormalizeQvec();
 
     ceres::CostFunction* cost_function =
-        RelativePoseConstraintCostFunction::Create(
-            constraint.qvec12, constraint.tvec12, constraint.rot_weight,
-            constraint.trans_weight);
+        RelativePoseTranslationNormCostFunction::Create(
+            constraint.tvec12, constraint.trans_weight);
 
     problem_->AddResidualBlock(cost_function, loss_function,
                                image1.Qvec().data(), image1.Tvec().data(),

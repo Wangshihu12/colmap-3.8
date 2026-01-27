@@ -31,7 +31,12 @@
 
 #include "ui/model_viewer_widget.h"
 
+#include <fstream>
+#include <sstream>
+#include <utility>
+
 #include "ui/main_window.h"
+#include "util/string.h"
 
 #define SELECTION_BUFFER_IMAGE_IDX 0
 #define SELECTION_BUFFER_POINT_IDX 1
@@ -43,6 +48,8 @@ const Eigen::Vector4f kSelectedImageFrameColor(0.8f, 0.0f, 0.8f, 1.0f);
 
 const Eigen::Vector4f kMovieGrabberImagePlaneColor(0.0f, 1.0f, 1.0f, 0.6f);
 const Eigen::Vector4f kMovieGrabberImageFrameColor(0.0f, 0.8f, 0.8f, 1.0f);
+
+const Eigen::Vector4f kLoopEdgeColor(1.0f, 0.6f, 0.0f, 0.9f);
 
 const Eigen::Vector4f kGridColor(0.2f, 0.2f, 0.2f, 0.6f);
 const Eigen::Vector4f kXAxisColor(0.9f, 0.0f, 0.0f, 0.5f);
@@ -66,6 +73,49 @@ inline Eigen::Vector4f IndexToRGB(const size_t index) {
   color(2) = ((index & 0x00FF0000) >> 16) / 255.0f;
   color(3) = 1.0f;
   return color;
+}
+
+enum class LoopEdgeParseResult {
+  kSkip,
+  kInvalid,
+  kValid,
+};
+
+LoopEdgeParseResult ParseLoopEdgeLine(const std::string& line,
+                                      image_t* image_id1,
+                                      image_t* image_id2) {
+  std::string content = line;
+  const auto comment_pos = content.find('#');
+  if (comment_pos != std::string::npos) {
+    content = content.substr(0, comment_pos);
+  }
+  StringTrim(&content);
+  if (content.empty()) {
+    return LoopEdgeParseResult::kSkip;
+  }
+
+  std::istringstream iss(content);
+  int64_t parsed_id1 = -1;
+  int64_t parsed_id2 = -1;
+  double qw = 0.0;
+  double qx = 0.0;
+  double qy = 0.0;
+  double qz = 0.0;
+  double tx = 0.0;
+  double ty = 0.0;
+  double tz = 0.0;
+  if (!(iss >> parsed_id1 >> parsed_id2 >> qw >> qx >> qy >> qz >> tx >> ty >>
+        tz)) {
+    return LoopEdgeParseResult::kInvalid;
+  }
+
+  if (parsed_id1 < 0 || parsed_id2 < 0) {
+    return LoopEdgeParseResult::kInvalid;
+  }
+
+  *image_id1 = static_cast<image_t>(parsed_id1);
+  *image_id2 = static_cast<image_t>(parsed_id2);
+  return LoopEdgeParseResult::kValid;
 }
 
 void BuildImageModel(const Image& image, const Camera& camera,
@@ -254,6 +304,7 @@ void ModelViewerWidget::paintGL() {
   image_line_painter_.Render(pmv_matrix, width(), height(), 1);
   image_triangle_painter_.Render(pmv_matrix);
   image_connection_painter_.Render(pmv_matrix, width(), height(), 1);
+  loop_edge_painter_.Render(pmv_matrix, width(), height(), 1.5f);
 
   // Movie grabber cameras
   movie_grabber_path_painter_.Render(pmv_matrix, width(), height(), 1.5);
@@ -307,6 +358,51 @@ void ModelViewerWidget::SetPointColormap(PointColormapBase* colormap) {
 
 void ModelViewerWidget::SetImageColormap(ImageColormapBase* colormap) {
   image_colormap_.reset(colormap);
+}
+
+bool ModelViewerWidget::LoadLoopEdges(const std::string& path,
+                                      size_t* num_loaded,
+                                      size_t* num_skipped) {
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    return false;
+  }
+
+  std::vector<std::pair<image_t, image_t>> loop_edges;
+  size_t skipped = 0;
+  std::string line;
+  while (std::getline(file, line)) {
+    image_t image_id1 = kInvalidImageId;
+    image_t image_id2 = kInvalidImageId;
+    const auto result = ParseLoopEdgeLine(line, &image_id1, &image_id2);
+    if (result == LoopEdgeParseResult::kSkip) {
+      continue;
+    }
+    if (result == LoopEdgeParseResult::kInvalid) {
+      skipped += 1;
+      continue;
+    }
+    loop_edges.emplace_back(image_id1, image_id2);
+  }
+
+  loop_edges_ = std::move(loop_edges);
+  UploadLoopEdgeData();
+  update();
+
+  if (num_loaded != nullptr) {
+    *num_loaded = loop_edges_.size();
+  }
+  if (num_skipped != nullptr) {
+    *num_skipped = skipped;
+  }
+
+  return true;
+}
+
+void ModelViewerWidget::ClearLoopEdges() {
+  loop_edges_.clear();
+  UploadLoopEdgeData();
+  update();
 }
 
 void ModelViewerWidget::UpdateMovieGrabber() {
@@ -654,6 +750,7 @@ void ModelViewerWidget::SetupPainters() {
   image_line_painter_.Setup();
   image_triangle_painter_.Setup();
   image_connection_painter_.Setup();
+  loop_edge_painter_.Setup();
 
   movie_grabber_path_painter_.Setup();
   movie_grabber_line_painter_.Setup();
@@ -681,6 +778,7 @@ void ModelViewerWidget::Upload() {
   UploadMovieGrabberData();
   UploadPointConnectionData();
   UploadImageConnectionData();
+  UploadLoopEdgeData();
 
   update();
 }
@@ -950,6 +1048,47 @@ void ModelViewerWidget::UploadImageConnectionData() {
   }
 
   image_connection_painter_.Upload(line_data);
+}
+
+void ModelViewerWidget::UploadLoopEdgeData() {
+  makeCurrent();
+
+  std::vector<LinePainter::Data> line_data;
+  if (!options_->render->loop_edges || loop_edges_.empty()) {
+    loop_edge_painter_.Upload(line_data);
+    return;
+  }
+
+  line_data.reserve(loop_edges_.size());
+  for (const auto& edge : loop_edges_) {
+    const auto image_it1 = images.find(edge.first);
+    const auto image_it2 = images.find(edge.second);
+    if (image_it1 == images.end() || image_it2 == images.end()) {
+      continue;
+    }
+
+    const Image& image1 = image_it1->second;
+    const Image& image2 = image_it2->second;
+    if (!image1.IsRegistered() || !image2.IsRegistered()) {
+      continue;
+    }
+
+    const Eigen::Vector3f proj_center1 =
+        image1.ProjectionCenter().cast<float>();
+    const Eigen::Vector3f proj_center2 =
+        image2.ProjectionCenter().cast<float>();
+
+    LinePainter::Data line;
+    line.point1 = PointPainter::Data(
+        proj_center1(0), proj_center1(1), proj_center1(2), kLoopEdgeColor(0),
+        kLoopEdgeColor(1), kLoopEdgeColor(2), kLoopEdgeColor(3));
+    line.point2 = PointPainter::Data(
+        proj_center2(0), proj_center2(1), proj_center2(2), kLoopEdgeColor(0),
+        kLoopEdgeColor(1), kLoopEdgeColor(2), kLoopEdgeColor(3));
+    line_data.push_back(line);
+  }
+
+  loop_edge_painter_.Upload(line_data);
 }
 
 void ModelViewerWidget::UploadMovieGrabberData() {

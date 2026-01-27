@@ -58,6 +58,9 @@ struct RenderOptions {
   // Whether to visualize image connections.
   bool image_connections = false;
 
+  // Whether to visualize loop edges.
+  bool loop_edges = true;
+
   // The projection type of the renderer.
   int projection_type = ProjectionType::PERSPECTIVE;
 

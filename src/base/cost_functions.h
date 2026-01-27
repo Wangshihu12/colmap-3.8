@@ -345,6 +345,50 @@ class RelativePoseConstraintCostFunction {
   const double trans_weight_;
 };
 
+// Cost function for relative pose constraints that only enforce the
+// translation magnitude (scale) between two camera poses.
+class RelativePoseTranslationNormCostFunction {
+ public:
+  RelativePoseTranslationNormCostFunction(const Eigen::Vector3d& tvec_12,
+                                          const double trans_weight)
+      : tvec_12_norm_(tvec_12.norm()), trans_weight_(trans_weight) {}
+
+  static ceres::CostFunction* Create(const Eigen::Vector3d& tvec_12,
+                                     const double trans_weight) {
+    return (new ceres::AutoDiffCostFunction<
+            RelativePoseTranslationNormCostFunction, 1, 4, 3, 4, 3>(
+        new RelativePoseTranslationNormCostFunction(tvec_12, trans_weight)));
+  }
+
+  template <typename T>
+  bool operator()(const T* const qvec1, const T* const tvec1,
+                  const T* const qvec2, const T* const tvec2,
+                  T* residuals) const {
+    // Predicted relative rotation: R_12 = R_2 * R_1^T.
+    const T qvec1_inv[4] = {qvec1[0], -qvec1[1], -qvec1[2], -qvec1[3]};
+    T qvec12_pred[4];
+    ceres::QuaternionProduct(qvec2, qvec1_inv, qvec12_pred);
+
+    // Predicted relative translation: t_12 = t_2 - R_12 * t_1.
+    T t1_rot[3];
+    ceres::UnitQuaternionRotatePoint(qvec12_pred, tvec1, t1_rot);
+    T tvec12_pred[3];
+    tvec12_pred[0] = tvec2[0] - t1_rot[0];
+    tvec12_pred[1] = tvec2[1] - t1_rot[1];
+    tvec12_pred[2] = tvec2[2] - t1_rot[2];
+
+    const T pred_norm = ceres::sqrt(tvec12_pred[0] * tvec12_pred[0] +
+                                    tvec12_pred[1] * tvec12_pred[1] +
+                                    tvec12_pred[2] * tvec12_pred[2]);
+    residuals[0] = T(trans_weight_) * (pred_norm - T(tvec_12_norm_));
+    return true;
+  }
+
+ private:
+  const double tvec_12_norm_;
+  const double trans_weight_;
+};
+
 inline void SetQuaternionManifold(ceres::Problem* problem, double* qvec) {
 #if CERES_VERSION_MAJOR >= 2 && CERES_VERSION_MINOR >= 1
   problem->SetManifold(qvec, new ceres::QuaternionManifold);

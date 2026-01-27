@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -23,6 +24,12 @@ struct LoopEdgeMeasurement {
   Eigen::Vector3d t_ij_dir = Eigen::Vector3d::Zero();
 };
 
+bool IsNumericToken(const std::string& token) {
+  char* end_ptr = nullptr;
+  std::strtod(token.c_str(), &end_ptr);
+  return end_ptr != token.c_str() && *end_ptr == '\0';
+}
+
 bool ParseLoopEdgeLine(const std::string& line,
                        LoopEdgeMeasurement* measurement) {
   std::string content = line;
@@ -36,6 +43,13 @@ bool ParseLoopEdgeLine(const std::string& line,
   }
 
   std::istringstream iss(content);
+  std::string first;
+  if (!(iss >> first)) {
+    return false;
+  }
+
+  bool has_type = !IsNumericToken(first);
+  std::string type_token;
   int64_t image_id1 = -1;
   int64_t image_id2 = -1;
   double qw = 0.0;
@@ -45,10 +59,27 @@ bool ParseLoopEdgeLine(const std::string& line,
   double tx = 0.0;
   double ty = 0.0;
   double tz = 0.0;
-  if (!(iss >> image_id1 >> image_id2 >> qw >> qx >> qy >> qz >> tx >> ty >>
-        tz)) {
+  if (has_type) {
+    type_token = first;
+    StringToLower(&type_token);
+    if (!(iss >> image_id1 >> image_id2 >> qw >> qx >> qy >> qz >> tx >> ty >>
+          tz)) {
+      return false;
+    }
+  } else {
+    image_id1 = std::stoll(first);
+    if (!(iss >> image_id2 >> qw >> qx >> qy >> qz >> tx >> ty >> tz)) {
+      return false;
+    }
+    type_token = "loop";
+  }
+
+  if (type_token == "odom") {
     return false;
   }
+
+  double t_is_unit = 1.0;
+  iss >> t_is_unit;  // optional in new format
 
   measurement->image_id1 = static_cast<image_t>(image_id1);
   measurement->image_id2 = static_cast<image_t>(image_id2);
@@ -143,10 +174,18 @@ int main(int argc, char** argv) {
       t_ij_dir_gt = tvec_ij / t_norm;
     }
 
+    // 增加一个简单的过滤,如果两张图像的相机中心距离超过10m,则跳过该边
+    // 注意: Tvec()不是相机中心位置,相机中心应使用ProjectionCenter()
+    const double dist = (image1.ProjectionCenter() - image2.ProjectionCenter()).norm();
+    if (dist > 10.0) {
+      num_skipped += 1;
+      continue;
+    }
+
     gt_file << measurement.image_id1 << " " << measurement.image_id2 << " "
             << q_ij_gt.w() << " " << q_ij_gt.x() << " " << q_ij_gt.y() << " "
-            << q_ij_gt.z() << " " << t_ij_dir_gt(0) << " " << t_ij_dir_gt(1)
-            << " " << t_ij_dir_gt(2) << "\n";
+            << q_ij_gt.z() << " " << tvec_ij(0) << " " << tvec_ij(1)
+            << " " << tvec_ij(2) << "\n";
 
     double rot_err_deg = -1.0;
     double trans_err_deg = -1.0;

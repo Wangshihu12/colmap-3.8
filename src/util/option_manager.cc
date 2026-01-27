@@ -748,6 +748,7 @@ void OptionManager::AddRenderOptions() {
                               &render->adapt_refresh_rate);
   AddAndRegisterDefaultOption("Render.image_connections",
                               &render->image_connections);
+  AddAndRegisterDefaultOption("Render.loop_edges", &render->loop_edges);
   AddAndRegisterDefaultOption("Render.projection_type",
                               &render->projection_type);
 }

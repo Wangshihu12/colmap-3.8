@@ -176,6 +176,12 @@ void MainWindow::CreateActions() {
           &MainWindow::ImportFrom);
   blocking_actions_.push_back(action_import_from_);
 
+  action_import_loop_edges_ =
+      new QAction(QIcon(":/media/import.png"), tr("Import loop edges"), this);
+  connect(action_import_loop_edges_, &QAction::triggered, this,
+          &MainWindow::ImportLoopEdges);
+  blocking_actions_.push_back(action_import_loop_edges_);
+
   action_export_ =
       new QAction(QIcon(":/media/export.png"), tr("Export model"), this);
   connect(action_export_, &QAction::triggered, this, &MainWindow::Export);
@@ -400,6 +406,7 @@ void MainWindow::CreateMenus() {
   file_menu->addSeparator();
   file_menu->addAction(action_import_);
   file_menu->addAction(action_import_from_);
+  file_menu->addAction(action_import_loop_edges_);
   file_menu->addSeparator();
   file_menu->addAction(action_export_);
   file_menu->addAction(action_export_all_);
@@ -733,6 +740,43 @@ void MainWindow::ImportFrom() {
     reconstruction_manager_widget_->SelectReconstruction(reconstruction_idx);
     action_render_now_->trigger();
   });
+}
+
+void MainWindow::ImportLoopEdges() {
+  if (!IsSelectedReconstructionValid()) {
+    return;
+  }
+
+  const std::string loop_edges_path =
+      QFileDialog::getOpenFileName(this, tr("Select loop edges file"), "",
+                                   tr("Loop edges (*.txt);;All files (*)"))
+          .toUtf8()
+          .constData();
+
+  // Selection canceled?
+  if (loop_edges_path == "") {
+    return;
+  }
+
+  size_t num_loaded = 0;
+  size_t num_skipped = 0;
+  if (!model_viewer_widget_->LoadLoopEdges(loop_edges_path, &num_loaded,
+                                           &num_skipped)) {
+    QMessageBox::critical(this, "", tr("Could not open loop edges file."));
+    return;
+  }
+
+  if (num_loaded == 0) {
+    QMessageBox::warning(this, "", tr("No valid loop edges found."));
+    return;
+  }
+
+  if (num_skipped > 0) {
+    const std::string message =
+        StringPrintf("Loaded %zu loop edges. Skipped %zu invalid lines.",
+                     num_loaded, num_skipped);
+    QMessageBox::information(this, "", message.c_str());
+  }
 }
 
 void MainWindow::Export() {
