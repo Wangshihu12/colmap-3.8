@@ -19,11 +19,13 @@
 #include "base/reconstruction.h"
 #include "controllers/bundle_adjustment.h"
 #include "controllers/incremental_mapper.h"
+#include "estimators/similarity_transform.h"
 #include "estimators/homography_matrix.h"
 #include "estimators/pose.h"
 #include "estimators/two_view_geometry.h"
 #include "estimators/utils.h"
 #include "feature/utils.h"
+#include "optim/ransac.h"
 #include "util/math.h"
 #include "util/misc.h"
 #include "util/string.h"
@@ -216,10 +218,10 @@ class SE3Manifold : public ceres::Manifold {
 enum class EdgeType { kOdom, kLoop };
 
 struct EdgeDefaults {
-  double odom_rot_weight = 1.0;
-  double odom_trans_weight = 1.0;
-  double loop_rot_weight = 5.0;
-  double loop_trans_weight = 2.0;
+  double odom_rot_weight = 5.0;
+  double odom_trans_weight = 5.0;
+  double loop_rot_weight = 20.0;
+  double loop_trans_weight = 20.0;
   bool odom_translation_is_unit = false;
   bool loop_translation_is_unit = true;
 };
@@ -486,7 +488,7 @@ bool WritePoseGraphEdgesToFile(const std::string& path,
                                std::string* error) {
   // 支持输出到标准输出（路径为"-"）
   if (path == "-") {
-    WritePoseGraphEdges(std::cout, edges, true);
+    WritePoseGraphEdges(std::cout, edges, false);
     return true;
   }
   // 打开文件
@@ -498,7 +500,7 @@ bool WritePoseGraphEdgesToFile(const std::string& path,
     return false;
   }
   // 写入文件
-  WritePoseGraphEdges(file, edges, true);
+  WritePoseGraphEdges(file, edges, false);
   return true;
 }
 
@@ -713,6 +715,203 @@ bool EstimateRelativePoseFromInliers(
   *q_ij = Eigen::Quaterniond(normalized_qvec(0), normalized_qvec(1),
                              normalized_qvec(2), normalized_qvec(3));
   *t_ij_dir = geom_copy.tvec.normalized();
+  return true;
+}
+
+/**
+ * [功能描述]：使用2D-2D内点匹配对应的不同3D点估计回环平移尺度
+ *            将匹配提升为3D-3D对应，通过Sim3(Umeyama+RANSAC)估计
+ *            i->j 的相似变换，取平移向量模长作为尺度
+ * @param reconstruction：3D重建结果
+ * @param geom：两视图几何信息（包含内点匹配）
+ * @param image_i：第一幅图像
+ * @param image_j：第二幅图像
+ * @param q_ij：相对旋转（从i到j）
+ * @param t_ij_dir：相对平移方向（单位向量）
+ * @param scale：输出参数，估计得到的尺度
+ * @param q_ij_out：输出参数，估计得到的相对旋转四元数
+ * @param t_ij_out：输出参数，估计得到的相对平移
+ * @return 估计成功返回true，否则返回false
+ */
+bool EstimateLoopScaleFromPointPairsSim3(
+    const Reconstruction& reconstruction, const TwoViewGeometry& geom,
+    const Image& image_i, const Image& image_j,
+    const Eigen::Quaterniond& q_ij, const Eigen::Vector3d& t_ij_dir,
+    double* scale, Eigen::Quaterniond& q_ij_out, Eigen::Vector3d& t_ij_out) {
+  if (scale == nullptr) {
+    return false;
+  }
+  if (t_ij_dir.squaredNorm() < 1e-12) {
+    return false;
+  }
+
+  const size_t kMinPointPairs = 12;  // 最少匹配点对数
+  const double kMinDepth = 1e-6;  // 最小深度阈值
+  const double kMinAbsTransCos = 0.2;  // 最小绝对平移余弦值
+  const double kMaxRotDiffRad = DegToRad(30.0);  // 最大旋转差异阈值
+
+  // 提取匹配点对应的3D点
+  std::vector<Eigen::Vector3d> points_i;
+  std::vector<Eigen::Vector3d> points_j;
+  points_i.reserve(geom.inlier_matches.size());
+  points_j.reserve(geom.inlier_matches.size());
+
+  // 获取两幅图像的旋转和平移矩阵
+  const Eigen::Matrix3d R_i = image_i.RotationMatrix();
+  const Eigen::Vector3d t_i = image_i.Tvec();
+  const Eigen::Matrix3d R_j = image_j.RotationMatrix();
+  const Eigen::Vector3d t_j = image_j.Tvec();
+
+  // 遍历匹配点，计算对应3D点在两视图相机坐标系下的坐标
+  for (const auto& match : geom.inlier_matches) {
+    if (match.point2D_idx1 >= image_i.NumPoints2D() ||
+        match.point2D_idx2 >= image_j.NumPoints2D()) {
+      continue;
+    }
+
+    // 获取匹配点对应的2D点
+    const Point2D& point2D_i = image_i.Point2D(match.point2D_idx1);
+    const Point2D& point2D_j = image_j.Point2D(match.point2D_idx2);
+    if (!point2D_i.HasPoint3D() || !point2D_j.HasPoint3D()) {
+      continue;
+    }
+
+    // 获取匹配点对应的3D点
+    const point3D_t point3D_id_i = point2D_i.Point3DId();
+    const point3D_t point3D_id_j = point2D_j.Point3DId();
+    if (!reconstruction.ExistsPoint3D(point3D_id_i) ||
+        !reconstruction.ExistsPoint3D(point3D_id_j)) {
+      continue;
+    }
+
+    // 计算3D点在两视图相机坐标系下的坐标
+    const Point3D& point3D_i = reconstruction.Point3D(point3D_id_i);
+    const Point3D& point3D_j = reconstruction.Point3D(point3D_id_j);
+    const Eigen::Vector3d xyz_i = R_i * point3D_i.XYZ() + t_i;
+    const Eigen::Vector3d xyz_j = R_j * point3D_j.XYZ() + t_j;
+    if (!xyz_i.allFinite() || !xyz_j.allFinite()) {
+      continue;
+    }
+    if (xyz_i.z() <= kMinDepth || xyz_j.z() <= kMinDepth) {
+      continue;
+    }
+
+    points_i.push_back(xyz_i);
+    points_j.push_back(xyz_j);
+  }
+
+  // 检查是否满足最少匹配点数要求
+  if (points_i.size() < kMinPointPairs) {
+    return false;
+  }
+
+  // 计算匹配点对应的3D点在两视图相机坐标系下的尺度
+  std::vector<double> norms;
+  norms.reserve(points_i.size() + points_j.size());
+  for (const auto& p : points_i) {
+    norms.push_back(p.norm());
+  }
+  for (const auto& p : points_j) {
+    norms.push_back(p.norm());
+  }
+  const double median_norm = Median(norms);
+  if (!std::isfinite(median_norm) || median_norm <= kMinDepth) {
+    return false;
+  }
+
+  // 设置RANSAC参数
+  RANSACOptions ransac_options;
+  ransac_options.max_error =
+      std::max(1e-12, std::pow(0.05 * median_norm, 2));
+  ransac_options.min_inlier_ratio = 0.2;
+  ransac_options.confidence = 0.999;
+  ransac_options.min_num_trials = 50;
+  ransac_options.max_num_trials = 2000;
+
+  // 使用相似变换估计器
+  using Sim3Estimator = SimilarityTransformEstimator<3, true>;
+  RANSAC<Sim3Estimator> ransac(ransac_options);
+  const auto report = ransac.Estimate(points_i, points_j);
+  if (!report.success) {
+    return false;
+  }
+  if (report.support.num_inliers < kMinPointPairs) {
+    return false;
+  }
+
+  // 提取内点
+  std::vector<Eigen::Vector3d> inlier_i;
+  std::vector<Eigen::Vector3d> inlier_j;
+  inlier_i.reserve(report.support.num_inliers);
+  inlier_j.reserve(report.support.num_inliers);
+  for (size_t idx = 0; idx < report.inlier_mask.size(); ++idx) {
+    if (report.inlier_mask[idx]) {
+      inlier_i.push_back(points_i[idx]);
+      inlier_j.push_back(points_j[idx]);
+    }
+  }
+
+  // 检查内点数量是否满足最少匹配点数要求
+  if (inlier_i.size() < kMinPointPairs) {
+    return false;
+  }
+
+  const auto models = Sim3Estimator::Estimate(inlier_i, inlier_j);
+  if (models.empty()) {
+    return false;
+  }
+
+  // 提取相似变换模型
+  const auto& model = models[0];
+  const Eigen::Matrix3d SR = model.leftCols<3>();
+  const Eigen::Vector3d t = model.col(3);
+  // 计算尺度因子
+  const double s =
+      (SR.col(0).norm() + SR.col(1).norm() + SR.col(2).norm()) / 3.0;
+  if (!std::isfinite(s) || s <= 0.0) {
+    return false;
+  }
+  if (!t.allFinite()) {
+    return false;
+  }
+
+  const Eigen::Matrix3d R_sim3 = SR / s;
+  if (!R_sim3.allFinite()) {
+    return false;
+  }
+  // 计算相对旋转
+  const Eigen::Matrix3d R_ij = q_ij.normalized().toRotationMatrix();
+  // 计算相对旋转的余弦值
+  double cos_angle = (R_sim3 * R_ij.transpose()).trace();
+  cos_angle = (cos_angle - 1.0) * 0.5;
+  cos_angle = std::max(-1.0, std::min(1.0, cos_angle));
+  // 计算相对旋转的差值
+  const double rot_diff = std::acos(cos_angle);
+  if (!std::isfinite(rot_diff) || rot_diff > kMaxRotDiffRad) {
+    return false;
+  }
+
+  // 计算相对平移的模长
+  const double t_norm = t.norm();
+  // 检查相对平移的模长是否满足最小深度阈值
+  if (!std::isfinite(t_norm) || t_norm <= kMinDepth) {
+    return false;
+  }
+
+  // 检查相对平移的余弦值是否满足最小余弦值阈值
+  const double trans_cos =
+      std::abs(t.normalized().dot(t_ij_dir.normalized()));
+  if (trans_cos < kMinAbsTransCos) {
+    return false;
+  }
+  // TODO: 是否可以直接用估算出来的相对位姿来进行回环约束???
+  // std::cout << "scale: " << t_norm << ", inliers: " << report.support.num_inliers << std::endl;
+
+  q_ij_out = Eigen::Quaterniond(R_sim3);
+  t_ij_out = t;
+
+  // 设置尺度因子
+  *scale = t_norm;
   return true;
 }
 
@@ -973,8 +1172,23 @@ std::vector<PoseGraphEdge> BuildLoopEdges(
     edge.image_id1 = i;
     edge.image_id2 = j;
     edge.q_ij = q_ij;
-    edge.t_ij = t_ij_dir;
-    edge.translation_is_unit = options.defaults.loop_translation_is_unit;
+    double loop_scale = 0.0;
+    Eigen::Quaterniond q_ij_sim3;
+    Eigen::Vector3d t_ij_sim3;
+    if (EstimateLoopScaleFromPointPairsSim3(reconstruction, geom, image_i,
+                                            image_j, q_ij, t_ij_dir,
+                                            &loop_scale, q_ij_sim3, t_ij_sim3)) {
+      // 只使用尺度信息调整平移向量
+      // edge.t_ij = t_ij_dir * loop_scale;
+      // edge.translation_is_unit = false;
+      // 直接使用sim3估计出来的旋转和平移
+      edge.q_ij = q_ij_sim3;
+      edge.t_ij = t_ij_sim3;
+      edge.translation_is_unit = false;
+    } else {
+      edge.t_ij = t_ij_dir;
+      edge.translation_is_unit = true;
+    }
     edge.rot_weight = options.defaults.loop_rot_weight;
     edge.trans_weight = options.defaults.loop_trans_weight;
 
@@ -1359,16 +1573,88 @@ int main(int argc, char** argv) {
       std::string error;
       if (ReadPoseGraphEdgesFromFile(options.manual_loop_path, options.defaults,
                                      &manual_edges, &error)) {
+        // 点的缓存,避免重复读取
+        std::unordered_map<image_t, std::vector<Eigen::Vector2d>> points_cache;
+        points_cache.reserve(reconstruction.RegImageIds().size());
+
         size_t added_manual = 0;
         for (auto& edge : manual_edges) {
           if (edge.type == EdgeType::kOdom) {
             continue;  // 跳过里程计类型
           }
           edge.type = EdgeType::kLoop;
+          if (!reconstruction.ExistsImage(edge.image_id1) ||
+              !reconstruction.ExistsImage(edge.image_id2)) {
+            continue;
+          }
+
           const image_pair_t pair_id =
               Database::ImagePairToPairId(edge.image_id1, edge.image_id2);
           if (occupied_pairs.count(pair_id) > 0) {
             continue;  // 跳过已存在的边
+          }
+
+          // 获取对应的图像和相机
+          const Image& image_i = reconstruction.Image(edge.image_id1);
+          const Image& image_j = reconstruction.Image(edge.image_id2);
+          const Camera& camera_i = reconstruction.Camera(image_i.CameraId());
+          const Camera& camera_j = reconstruction.Camera(image_j.CameraId());
+
+          // 获取图像对的双视图几何
+          TwoViewGeometry geom =
+              database.ReadTwoViewGeometry(edge.image_id1, edge.image_id2);
+
+          // 获取图像对的相对位姿
+          Eigen::Quaterniond q_ij = edge.q_ij;
+          Eigen::Vector3d t_ij_dir = edge.t_ij;
+
+          // 如果边中没有位姿信息，则尝试从几何中恢复
+          if (q_ij.squaredNorm() < 1e-12 ||
+              t_ij_dir.squaredNorm() < 1e-12) {
+            if (geom.qvec.squaredNorm() > 1e-12 &&
+                geom.tvec.squaredNorm() > 1e-12) {
+              const Eigen::Vector4d normalized_qvec =
+                  NormalizeQuaternion(geom.qvec);
+              q_ij = Eigen::Quaterniond(normalized_qvec(0), normalized_qvec(1),
+                                        normalized_qvec(2), normalized_qvec(3));
+              t_ij_dir = geom.tvec.normalized();
+            } else {
+              Eigen::Quaterniond q_ij_est;
+              Eigen::Vector3d t_ij_dir_est;
+              if (EstimateRelativePoseFromInliers(
+                      geom, image_i, image_j, camera_i, camera_j, &database,
+                      &points_cache, &q_ij_est, &t_ij_dir_est)) {
+                q_ij = q_ij_est;
+                t_ij_dir = t_ij_dir_est;
+              }
+            }
+          }
+
+          // 如果是归一化的边,则尝试估计尺度
+          if (edge.translation_is_unit &&
+              t_ij_dir.squaredNorm() > 1e-12 &&
+              q_ij.squaredNorm() > 1e-12) {
+            double loop_scale = 0.0;
+            Eigen::Quaterniond q_ij_sim3;
+            Eigen::Vector3d t_ij_sim3;
+            if (EstimateLoopScaleFromPointPairsSim3(
+                    reconstruction, geom, image_i, image_j, q_ij, t_ij_dir,
+                    &loop_scale, q_ij_sim3, t_ij_sim3)) {
+              // 只使用尺度信息调整平移向量
+              // edge.t_ij = t_ij_dir * loop_scale;
+              // edge.translation_is_unit = false;
+              // 直接使用sim3估计出来的旋转和平移
+              edge.q_ij = q_ij_sim3;
+              edge.t_ij = t_ij_sim3;
+              edge.translation_is_unit = false;
+            } else if (edge.t_ij.squaredNorm() > 1e-12) {
+              edge.t_ij.normalize();
+              edge.translation_is_unit = true;
+            }
+          }
+
+          if (q_ij.squaredNorm() > 1e-12) {
+            edge.q_ij = q_ij;
           }
           occupied_pairs.insert(pair_id);
           edges.push_back(edge);
@@ -1424,19 +1710,19 @@ int main(int argc, char** argv) {
     image.SetTvec(t);
   }
 
-  // 全局BA优化
-  BundleAdjustmentOptions ba_options;
-  ba_options.refine_focal_length = false;
-  ba_options.refine_principal_point = false;
+  // // 全局BA优化
+  // BundleAdjustmentOptions ba_options;
+  // ba_options.refine_focal_length = false;
+  // ba_options.refine_principal_point = false;
 
-  colmap::BundleAdjustmentConfig ba_config;
-  // 把所有已注册的 image 加进去
-  for (const auto image_id : reconstruction.RegImageIds()) {
-    ba_config.AddImage(image_id);
-  }
+  // colmap::BundleAdjustmentConfig ba_config;
+  // // 把所有已注册的 image 加进去
+  // for (const auto image_id : reconstruction.RegImageIds()) {
+  //   ba_config.AddImage(image_id);
+  // }
 
-  colmap::BundleAdjuster bundle_adjuster(ba_options, ba_config);
-  bundle_adjuster.Solve(&reconstruction);
+  // colmap::BundleAdjuster bundle_adjuster(ba_options, ba_config);
+  // bundle_adjuster.Solve(&reconstruction);
 
   // ========== 8. 评估并保存结果 ==========
   const double post_error = reconstruction.ComputeMeanReprojectionError();

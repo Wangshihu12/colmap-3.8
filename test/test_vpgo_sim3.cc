@@ -179,13 +179,12 @@ struct Sim3RelativePoseCost {
   Sim3RelativePoseCost(const Eigen::Quaterniond& q_ij,
                        const Eigen::Vector3d& t_ij_dir,
                        const double t_ij_scale, const double rot_weight,
-                       const double trans_weight, const double scale_weight)
+                       const double trans_weight)
       : q_ij_(q_ij),
         t_ij_dir_(t_ij_dir),
         t_ij_scale_(t_ij_scale),
         rot_weight_(rot_weight),
-        trans_weight_(trans_weight),
-        scale_weight_(scale_weight) {}
+        trans_weight_(trans_weight) {}
 
   template <typename T>
   bool operator()(const T* const pose_i, const T* const pose_j,
@@ -216,16 +215,12 @@ struct Sim3RelativePoseCost {
     Eigen::Matrix<T, 3, 1> t_pred = t_j - s_ij * (q_ij_pred * t_i);
     // 直接约束完整平移向量（由方向 + 尺度构成）
     Eigen::Matrix<T, 3, 1> r_trans = t_pred - t_ij_obs;
-    // 额外尺度残差：约束平移长度
-    const T r_scale = t_pred.norm() - t_ij_scale;
-
     residuals[0] = T(rot_weight_) * r_rot(0);
     residuals[1] = T(rot_weight_) * r_rot(1);
     residuals[2] = T(rot_weight_) * r_rot(2);
     residuals[3] = T(trans_weight_) * r_trans(0);
     residuals[4] = T(trans_weight_) * r_trans(1);
     residuals[5] = T(trans_weight_) * r_trans(2);
-    residuals[6] = T(scale_weight_) * r_scale;
 
     return true;
   }
@@ -234,11 +229,10 @@ struct Sim3RelativePoseCost {
                                      const Eigen::Vector3d& t_ij_dir,
                                      const double t_ij_scale,
                                      const double rot_weight,
-                                     const double trans_weight,
-                                     const double scale_weight) {
-    return new ceres::AutoDiffCostFunction<Sim3RelativePoseCost, 7, 8, 8>(
+                                     const double trans_weight) {
+    return new ceres::AutoDiffCostFunction<Sim3RelativePoseCost, 6, 8, 8>(
         new Sim3RelativePoseCost(q_ij, t_ij_dir, t_ij_scale, rot_weight,
-                                 trans_weight, scale_weight));
+                                 trans_weight));
   }
 
  private:
@@ -247,7 +241,6 @@ struct Sim3RelativePoseCost {
   double t_ij_scale_;
   double rot_weight_;
   double trans_weight_;
-  double scale_weight_;
 };
 
 class Sim3Manifold : public ceres::Manifold {
@@ -333,6 +326,41 @@ class Sim3Manifold : public ceres::Manifold {
     return true;
   }
 };
+
+bool ParseLoopEdgeMeasurement(const std::string& line, image_t* image_id1,
+                              image_t* image_id2, Eigen::Quaterniond* q_ij,
+                              Eigen::Vector3d* t_ij) {
+  std::string content = line;
+  const auto comment_pos = content.find('#');
+  if (comment_pos != std::string::npos) {
+    content = content.substr(0, comment_pos);
+  }
+  StringTrim(&content);
+  if (content.empty()) {
+    return false;
+  }
+
+  std::istringstream iss(content);
+  int64_t id1 = -1;
+  int64_t id2 = -1;
+  double qw = 0.0;
+  double qx = 0.0;
+  double qy = 0.0;
+  double qz = 0.0;
+  double tx = 0.0;
+  double ty = 0.0;
+  double tz = 0.0;
+  if (!(iss >> id1 >> id2 >> qw >> qx >> qy >> qz >> tx >> ty >> tz)) {
+    return false;
+  }
+
+  *image_id1 = static_cast<image_t>(id1);
+  *image_id2 = static_cast<image_t>(id2);
+  *q_ij = Eigen::Quaterniond(qw, qx, qy, qz);
+  q_ij->normalize();
+  *t_ij = Eigen::Vector3d(tx, ty, tz);
+  return true;
+}
 
 // 从数据库读取关键点，并缓存为二维点坐标
 const std::vector<Eigen::Vector2d>& GetOrLoadImagePoints(
@@ -565,231 +593,99 @@ int main(int argc, char** argv) {
     problem.AddParameterBlock(pose, 8, new Sim3Manifold());
   }
 
+  std::vector<image_pair_t> image_pair_ids;
+  std::vector<TwoViewGeometry> two_view_geometries;
+  database.ReadTwoViewGeometries(&image_pair_ids, &two_view_geometries);
+
+  // 权重
+  double odom_rot_weight = 1.0;
+  double odom_trans_weight = 1.0;
+  double loop_rot_weight = 5.0;
+  double loop_trans_weight = 2.0;
+
   // ----------------------------
-  // 构建序列边（按相机分组，按image_id递增）
+  // 构建序列边
   // ----------------------------
   // 统计边的数量
   int num_edge = 0;  // 序列边（里程计边）数量
   int num_loop = 0;  // 回环边数量
 
-  // 按相机分组并按image_id升序排序
-  std::unordered_map<camera_t, std::vector<image_t>> camera_image_ids;
-  camera_image_ids.reserve(reconstruction.Cameras().size());
-  std::vector<image_t> all_image_ids;
-  all_image_ids.reserve(reconstruction.RegImageIds().size());
-  for (const auto image_id : reconstruction.RegImageIds()) {
-    const Image& image = reconstruction.Image(image_id);
-    camera_image_ids[image.CameraId()].push_back(image_id);
-    all_image_ids.push_back(image_id);
-  }
+  for (size_t k = 0; k < image_pair_ids.size(); ++k) {
+    image_t i;
+    image_t j;
+    Database::PairIdToImagePair(image_pair_ids[k], &i, &j);
+    const TwoViewGeometry& geom = two_view_geometries[k];
+    // std::cout << "q_ij: " << geom.qvec.transpose() << "\n";
 
-  if (all_image_ids.empty()) {
-    std::cout << "no registered images found in reconstruction.\n";
-    return -1;
-  }
-
-  for (auto& pair : camera_image_ids) {
-    auto& ids = pair.second;
-    std::sort(ids.begin(), ids.end());
-  }
-
-  std::sort(all_image_ids.begin(), all_image_ids.end());
-
-  const double min_tri_angle = DegToRad(1.0);
-
-  // 记录已添加的序列边，避免后续回环边重复使用同一对
-  std::unordered_set<image_pair_t> sequential_pairs;
-  sequential_pairs.reserve(all_image_ids.size());
-
-  // 构建序列边：对每个相机按image_id递增连接相邻帧
-  for (const auto& pair : camera_image_ids) {
-    const auto& ids = pair.second;
-    if (ids.size() < 2) {
+    if (!reconstruction.ExistsImage(i) || !reconstruction.ExistsImage(j)) {
       continue;
     }
-    for (size_t idx = 0; idx + 1 < ids.size(); ++idx) {
-      const image_t image_id_i = ids[idx];
-      const image_t image_id_j = ids[idx + 1];
-      const Image& image_i = reconstruction.Image(image_id_i);
-      const Image& image_j = reconstruction.Image(image_id_j);
 
-      // 用当前重建位姿计算相对位姿，作为序列边约束
-      Eigen::Vector4d qvec_ij;
-      Eigen::Vector3d tvec_ij;
-      ComputeRelativePose(image_i.Qvec(), image_i.Tvec(), image_j.Qvec(),
-                          image_j.Tvec(), &qvec_ij, &tvec_ij);
+    if (std::abs(static_cast<int>(i) - static_cast<int>(j)) <= 10) {
+      // sequential edges   odom edge
+      const Image& image_i = reconstruction.Image(i);
+      const Image& image_j = reconstruction.Image(j);
 
-      const Eigen::Quaterniond q_ij(qvec_ij(0), qvec_ij(1), qvec_ij(2),
-                                    qvec_ij(3));
-      const Eigen::Vector3d t_ij = tvec_ij;
-      const double t_ij_scale = t_ij.norm();
-      if (t_ij_scale <= 1e-12) {
-        continue;
-      }
-      const Eigen::Vector3d t_ij_dir = t_ij / t_ij_scale;
+      Eigen::Quaterniond q_i(image_i.Qvec()[0], image_i.Qvec()[1],
+                             image_i.Qvec()[2], image_i.Qvec()[3]);
+      Eigen::Vector3d t_i = image_i.Tvec();
 
-      // 序列边使用Sim3约束：方向 + 尺度构成完整平移，并强化尺度残差
-      const double scale_weight = 1.0;
-      ceres::CostFunction* cost = Sim3RelativePoseCost::Create(
-          q_ij, t_ij_dir, t_ij_scale, 1.0, 1.0, scale_weight);
-      problem.AddResidualBlock(cost, nullptr, pose_params[image_id_i],
-                               pose_params[image_id_j]);
-      sequential_pairs.insert(
-          Database::ImagePairToPairId(image_id_i, image_id_j));
+      Eigen::Quaterniond q_j(image_j.Qvec()[0], image_j.Qvec()[1],
+                             image_j.Qvec()[2], image_j.Qvec()[3]);
+      Eigen::Vector3d t_j = image_j.Tvec();
+
+      Eigen::Quaterniond q_ij = q_j * q_i.conjugate();
+      Eigen::Vector3d t_ij = t_j - (q_ij * t_i);
+      double t_ij_norm = t_ij.norm();
+      Eigen::Vector3d t_ij_dir = t_ij.normalized();
+      ceres::CostFunction* cost =
+          Sim3RelativePoseCost::Create(q_ij, t_ij_dir, t_ij_norm,
+                                       odom_rot_weight,   // rot
+                                       odom_trans_weight);  // trans
+      problem.AddResidualBlock(cost, nullptr, pose_params[i], pose_params[j]);
       num_edge++;
     }
   }
 
   // ----------------------------
-  // 构建回环边（来自双视图几何）
+  // 构建回环边（手动添加）
   // ----------------------------
-  std::vector<image_pair_t> image_pair_ids;
-  std::vector<TwoViewGeometry> two_view_geometries;
-  database.ReadTwoViewGeometries(&image_pair_ids, &two_view_geometries);
-  // 缓存关键点坐标，避免重复访问数据库
-  std::unordered_map<image_t, std::vector<Eigen::Vector2d>> points_cache;
-  points_cache.reserve(reconstruction.RegImageIds().size());
-
-  // 按内点数量从高到低处理候选，有助于后续稀疏化保留高质量边
-  std::vector<size_t> loop_indices(image_pair_ids.size());
-  std::iota(loop_indices.begin(), loop_indices.end(), 0);
-  std::sort(loop_indices.begin(), loop_indices.end(),
-            [&](size_t a, size_t b) {
-              return two_view_geometries[a].inlier_matches.size() >
-                     two_view_geometries[b].inlier_matches.size();
-            });
-
-  // 控制回环边稀疏度：限制每张图像参与的回环边数量
-  const size_t kMaxLoopEdgesPerImage = 30;
-  std::unordered_map<image_t, size_t> loop_degree;
-  loop_degree.reserve(reconstruction.RegImageIds().size());
-
-  const double max_error_px = 4.0;
-  const double min_inlier_ratio = 0.2;
-
-  for (const size_t idx : loop_indices) {
-    image_t i;
-    image_t j;
-    Database::PairIdToImagePair(image_pair_ids[idx], &i, &j);
-    const TwoViewGeometry& geom = two_view_geometries[idx];
-
-    // 只处理参与优化的图像对
-    if (pose_params.find(i) == pose_params.end() ||
-        pose_params.find(j) == pose_params.end()) {
-      continue;
-    }
-
-    const image_pair_t pair_id = Database::ImagePairToPairId(i, j);
-    // 已作为序列边的对不再作为回环边
-    if (sequential_pairs.count(pair_id) > 0) {
-      continue;
-    }
-
-    // 过滤掉id差小于100的图像对，避免近邻帧被误认为回环
-    if (std::abs(static_cast<int>(i) - static_cast<int>(j)) < 100) {
-      continue;
-    }
-
-    // 仅保留标定情形，避免UNCALIBRATED时E为空导致相对位姿不可靠
-    if (geom.config == colmap::TwoViewGeometry::UNDEFINED ||
-        geom.config == colmap::TwoViewGeometry::DEGENERATE ||
-        geom.config == colmap::TwoViewGeometry::WATERMARK ||
-        geom.config == colmap::TwoViewGeometry::MULTIPLE) {
-      continue;
-    }
-
-    const size_t num_inliers = geom.inlier_matches.size();
-    // 过滤内点过少的回环
-    if (num_inliers < 200) {
-      continue;
-    }
-
-    // 基于内点比例的过滤：内点比例过低的回环容易误检
-    const FeatureMatches matches = database.ReadMatches(i, j);
-    if (matches.empty()) {
-      continue;
-    }
-    const double inlier_ratio =
-        static_cast<double>(num_inliers) /
-        static_cast<double>(matches.size());
-    if (inlier_ratio < min_inlier_ratio) {
-      continue;
-    }
-
-    // 过滤三角化角过小的回环（几何退化）
-    if (geom.tri_angle > 0 && geom.tri_angle < min_tri_angle) {
-      continue;
-    }
-
-    // 基于几何误差的过滤：误差过大说明模型不可靠
-    const Image& image_i = reconstruction.Image(i);
-    const Image& image_j = reconstruction.Image(j);
-    const Camera& camera_i = reconstruction.Camera(image_i.CameraId());
-    const Camera& camera_j = reconstruction.Camera(image_j.CameraId());
-    if (!PassesGeometricErrorFilter(geom, image_i, image_j, camera_i, camera_j,
-                                    &database, &points_cache, max_error_px)) {
-      continue;
-    }
-
-    Eigen::Quaterniond q_ij;
-    Eigen::Vector3d t_ij_dir;
-    double t_ij_scale = 0.0;
-    if (geom.qvec.squaredNorm() > 1e-12 && geom.tvec.squaredNorm() > 1e-12) {
-      // 数据库中已有相对位姿，直接使用
-      const Eigen::Vector4d normalized_qvec =
-          colmap::NormalizeQuaternion(geom.qvec);
-      q_ij = Eigen::Quaterniond(normalized_qvec(0), normalized_qvec(1),
-                                normalized_qvec(2), normalized_qvec(3));
-      t_ij_dir = geom.tvec.normalized();
+  const std::string loop_edges_gt_path =
+      JoinPaths(output_path, "loop_edges_gt.txt");
+  if (ExistsFile(loop_edges_gt_path)) {
+    std::ifstream loop_edges_gt_file(loop_edges_gt_path);
+    if (!loop_edges_gt_file.is_open()) {
+      std::cout << "WARNING: Could not open loop edges file at "
+                << loop_edges_gt_path << std::endl;
     } else {
-      // 数据库未存qvec/tvec时，基于匹配内点估计相对位姿
-      if (!EstimateRelativePoseFromInliers(
-              geom, image_i, image_j, camera_i, camera_j, &database,
-              &points_cache, &q_ij, &t_ij_dir)) {
-        continue;
+      size_t num_manual_loops = 0;
+      std::string line;
+      while (std::getline(loop_edges_gt_file, line)) {
+        image_t i = kInvalidImageId;
+        image_t j = kInvalidImageId;
+        Eigen::Quaterniond q_ij;
+        Eigen::Vector3d t_ij;
+        if (!ParseLoopEdgeMeasurement(line, &i, &j, &q_ij, &t_ij)) {
+          continue;
+        }
+
+        if (pose_params.find(i) == pose_params.end() ||
+            pose_params.find(j) == pose_params.end()) {
+          continue;
+        }
+
+        Eigen::Vector3d t_ij_dir = t_ij.normalized();
+
+        double t_ij_scale = t_ij.norm();
+
+        ceres::CostFunction* cost = Sim3RelativePoseCost::Create(
+            q_ij, t_ij_dir, t_ij_scale, loop_rot_weight, loop_trans_weight);
+        problem.AddResidualBlock(cost, new ceres::HuberLoss(1.0),
+                                 pose_params[i], pose_params[j]);
+
+        num_loop++;
       }
     }
-
-    // 使用重建中两相机中心的距离作为回环尺度
-    const Eigen::Vector3d center_i =
-        ProjectionCenterFromPose(image_i.Qvec(), image_i.Tvec());
-    const Eigen::Vector3d center_j =
-        ProjectionCenterFromPose(image_j.Qvec(), image_j.Tvec());
-    t_ij_scale = (center_j - center_i).norm();
-    if (t_ij_scale <= 1e-12) {
-      continue;
-    }
-    // std::cout << "q_ij: " << q_ij.w() << " " << q_ij.x() << " " << q_ij.y() << " " << q_ij.z() << std::endl;
-    // std::cout << "t_ij_dir: " << t_ij_dir.transpose() << std::endl;
-
-    // 回环边权重：根据内点数和三角化角调节
-    const double inlier_scale =
-        std::min(3.0, std::sqrt(static_cast<double>(num_inliers) / 200.0));
-    // tri_scale 用于抑制小三角化角（近退化）的边
-    const double tri_scale =
-        (geom.tri_angle > 0) ? std::min(2.0, geom.tri_angle / min_tri_angle)
-                             : 1.0;
-    // const double rot_weight = 5.0 * inlier_scale * tri_scale;
-    const double rot_weight = 5.0;
-    // const double trans_weight = 2.0 * inlier_scale * tri_scale;
-    const double trans_weight = 1.0;
-    // 回环边尺度不确定，尺度残差权重设置为较小值
-    const double scale_weight = 0.1;
-
-    // 稀疏度控制：限制每张图像参与的回环边数量
-    if (loop_degree[i] >= kMaxLoopEdgesPerImage ||
-        loop_degree[j] >= kMaxLoopEdgesPerImage) {
-      continue;
-    }
-
-    ceres::CostFunction* cost = Sim3RelativePoseCost::Create(
-        q_ij, t_ij_dir, t_ij_scale, rot_weight, trans_weight, scale_weight);
-    // 回环边加入Huber鲁棒核，降低误匹配的影响
-    problem.AddResidualBlock(cost, new ceres::HuberLoss(1.0), pose_params[i],
-                             pose_params[j]);
-    loop_degree[i] += 1;
-    loop_degree[j] += 1;
-    num_loop++;
   }
 
   // ----------------------------
@@ -797,7 +693,7 @@ int main(int argc, char** argv) {
   // ----------------------------
   // 固定第一张图像的位姿以消除位姿图的全局自由度（6 DoF）
   // 否则整个位姿图可以任意平移和旋转
-  image_t root_id = all_image_ids.front();
+  image_t root_id = reconstruction.Images().begin()->first;
   problem.SetParameterBlockConstant(pose_params[root_id]);
 
   std::cout << "num_edge: " << num_edge << ", num_loop: " << num_loop << "\n";
