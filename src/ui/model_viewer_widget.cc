@@ -31,6 +31,7 @@
 
 #include "ui/model_viewer_widget.h"
 
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <utility>
@@ -75,6 +76,12 @@ inline Eigen::Vector4f IndexToRGB(const size_t index) {
   return color;
 }
 
+inline bool IsNumericToken(const std::string& token) {
+  char* end_ptr = nullptr;
+  std::strtod(token.c_str(), &end_ptr);
+  return end_ptr != token.c_str() && *end_ptr == '\0';
+}
+
 enum class LoopEdgeParseResult {
   kSkip,
   kInvalid,
@@ -95,6 +102,13 @@ LoopEdgeParseResult ParseLoopEdgeLine(const std::string& line,
   }
 
   std::istringstream iss(content);
+  std::string first;
+  if (!(iss >> first)) {
+    return LoopEdgeParseResult::kSkip;
+  }
+
+  const bool has_type = !IsNumericToken(first);
+  std::string type_token = "loop";
   int64_t parsed_id1 = -1;
   int64_t parsed_id2 = -1;
   double qw = 0.0;
@@ -104,8 +118,25 @@ LoopEdgeParseResult ParseLoopEdgeLine(const std::string& line,
   double tx = 0.0;
   double ty = 0.0;
   double tz = 0.0;
-  if (!(iss >> parsed_id1 >> parsed_id2 >> qw >> qx >> qy >> qz >> tx >> ty >>
-        tz)) {
+
+  if (has_type) {
+    type_token = first;
+    StringToLower(&type_token);
+    if (!(iss >> parsed_id1 >> parsed_id2 >> qw >> qx >> qy >> qz >> tx >> ty >>
+          tz)) {
+      return LoopEdgeParseResult::kInvalid;
+    }
+  } else {
+    parsed_id1 = std::stoll(first);
+    if (!(iss >> parsed_id2 >> qw >> qx >> qy >> qz >> tx >> ty >> tz)) {
+      return LoopEdgeParseResult::kInvalid;
+    }
+  }
+
+  if (type_token == "odom") {
+    return LoopEdgeParseResult::kSkip;
+  }
+  if (has_type && type_token != "loop") {
     return LoopEdgeParseResult::kInvalid;
   }
 
