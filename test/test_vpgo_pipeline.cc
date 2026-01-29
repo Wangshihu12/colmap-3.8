@@ -12,6 +12,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include <boost/property_tree/json_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
+
 #include <ceres/ceres.h>
 
 #include "base/database.h"
@@ -215,15 +218,18 @@ class SE3Manifold : public ceres::Manifold {
   }
 };
 
-enum class EdgeType { kOdom, kLoop };
+enum class EdgeType { kOdom, kLoop, kRig };
 
 struct EdgeDefaults {
-  double odom_rot_weight = 5.0;
-  double odom_trans_weight = 5.0;
-  double loop_rot_weight = 20.0;
-  double loop_trans_weight = 20.0;
+  double odom_rot_weight = 2.0;
+  double odom_trans_weight = 2.0;
+  double loop_rot_weight = 2.0;
+  double loop_trans_weight = 2.0;
+  double rig_rot_weight = 5.0;
+  double rig_trans_weight = 5.0;
   bool odom_translation_is_unit = false;
   bool loop_translation_is_unit = true;
+  bool rig_translation_is_unit = false;
 };
 
 struct PoseGraphEdge {
@@ -244,6 +250,7 @@ struct PipelineOptions {
   std::string edge_input_path;
   std::string edge_output_path;
   std::string manual_loop_path;
+  std::string rig_config_path;
   bool build_odom_edges = true;
   bool build_loop_edges = true;
   bool run_self_test = false;
@@ -264,13 +271,202 @@ bool IsNumericToken(const std::string& token) {
 }
 
 std::string EdgeTypeToString(const EdgeType type) {
-  return type == EdgeType::kOdom ? "odom" : "loop";
+  if (type == EdgeType::kOdom) {
+    return "odom";
+  }
+  if (type == EdgeType::kRig) {
+    return "rig";
+  }
+  return "loop";
+}
+
+struct RigCameraConfig {
+  camera_t camera_id = kInvalidCameraId;
+  std::string image_prefix;
+  Eigen::Quaterniond rel_qvec = Eigen::Quaterniond::Identity();
+  Eigen::Vector3d rel_tvec = Eigen::Vector3d::Zero();
+};
+
+struct RigConfig {
+  camera_t ref_camera_id = kInvalidCameraId;
+  std::vector<RigCameraConfig> cameras;
+  std::unordered_map<camera_t, size_t> camera_index;
+};
+
+const RigCameraConfig* FindRigCamera(const RigConfig& rig,
+                                     const camera_t camera_id) {
+  const auto it = rig.camera_index.find(camera_id);
+  if (it == rig.camera_index.end()) {
+    return nullptr;
+  }
+  return &rig.cameras[it->second];
+}
+
+std::string ExtractSnapshotKeyFromName(const std::string& name) {
+  if (name.empty()) {
+    return "";
+  }
+  std::string base = name;
+  const size_t sep_pos = base.find_last_of("/\\");
+  if (sep_pos != std::string::npos) {
+    base = base.substr(sep_pos + 1);
+  }
+  const size_t dot_pos = base.find_last_of('.');
+  if (dot_pos != std::string::npos) {
+    base = base.substr(0, dot_pos);
+  }
+  StringTrim(&base);
+  return base;
+}
+
+std::string ExtractSnapshotKey(const std::string& image_name,
+                               const std::string& image_prefix) {
+  std::string suffix = image_name;
+  if (!image_prefix.empty() && StringContains(image_name, image_prefix)) {
+    suffix = StringGetAfter(image_name, image_prefix);
+  }
+  while (!suffix.empty() &&
+         (suffix[0] == '/' || suffix[0] == '\\' || suffix[0] == '_' ||
+          suffix[0] == '-')) {
+    suffix.erase(suffix.begin());
+  }
+  std::string key = ExtractSnapshotKeyFromName(suffix);
+  if (key.empty()) {
+    key = ExtractSnapshotKeyFromName(image_name);
+  }
+  return key;
+}
+
+bool ParsePtreeVector(const boost::property_tree::ptree& node,
+                      const size_t expected_size,
+                      std::vector<double>* values) {
+  if (values == nullptr) {
+    return false;
+  }
+  values->clear();
+  values->reserve(expected_size);
+  for (const auto& child : node) {
+    values->push_back(child.second.get_value<double>());
+  }
+  return values->size() == expected_size;
+}
+
+/**
+ * [功能描述]：从JSON文件读取相机rig配置
+ * @param path：JSON配置文件的路径
+ * @param rig_configs：输出参数，解析后的rig配置列表
+ * @param error：输出参数，解析失败时的错误信息
+ * @return 解析成功返回true，失败返回false
+ */
+bool ReadRigConfigFromFile(const std::string& path,
+                           std::vector<RigConfig>* rig_configs,
+                           std::string* error) {
+  // 检查输出参数是否有效
+  if (rig_configs == nullptr) {
+    if (error != nullptr) {
+      *error = "rig configs output is null";
+    }
+    return false;
+  }
+  rig_configs->clear();
+
+  // 使用boost解析JSON文件
+  boost::property_tree::ptree pt;
+  try {
+    boost::property_tree::read_json(path.c_str(), pt);
+  } catch (const std::exception& e) {
+    if (error != nullptr) {
+      *error = e.what();
+    }
+    return false;
+  }
+
+  // 遍历JSON中的每个rig配置节点
+  for (const auto& rig_node : pt) {
+    RigConfig rig;
+    // 读取参考相机ID（用于定义rig坐标系）
+    rig.ref_camera_id =
+        rig_node.second.get<camera_t>("ref_camera_id", kInvalidCameraId);
+
+    // 获取cameras子节点
+    const auto cameras_node = rig_node.second.get_child_optional("cameras");
+    if (!cameras_node) {
+      if (error != nullptr) {
+        *error = "rig config missing cameras";
+      }
+      return false;
+    }
+
+    // 遍历rig中的每个相机配置
+    for (const auto& camera_node : cameras_node.get()) {
+      RigCameraConfig cam;
+      // 读取相机ID和图像前缀
+      cam.camera_id =
+          camera_node.second.get<camera_t>("camera_id", kInvalidCameraId);
+      cam.image_prefix =
+          camera_node.second.get<std::string>("image_prefix", "");
+
+      // 获取相对位姿（四元数和平移向量）节点
+      const auto rel_qvec_node =
+          camera_node.second.get_child_optional("rel_qvec");
+      const auto rel_tvec_node =
+          camera_node.second.get_child_optional("rel_tvec");
+      if (!rel_qvec_node || !rel_tvec_node) {
+        if (error != nullptr) {
+          *error = "rig config missing rel_qvec or rel_tvec";
+        }
+        return false;
+      }
+
+      // 解析四元数(4维)和平移向量(3维)
+      std::vector<double> qvec;
+      std::vector<double> tvec;
+      if (!ParsePtreeVector(rel_qvec_node.get(), 4, &qvec) ||
+          !ParsePtreeVector(rel_tvec_node.get(), 3, &tvec)) {
+        if (error != nullptr) {
+          *error = "rig config invalid rel_qvec or rel_tvec size";
+        }
+        return false;
+      }
+
+      // 构建四元数并归一化
+      cam.rel_qvec = Eigen::Quaterniond(qvec[0], qvec[1], qvec[2], qvec[3]);
+      if (cam.rel_qvec.norm() > 1e-12) {
+        cam.rel_qvec.normalize();
+      } else {
+        cam.rel_qvec = Eigen::Quaterniond::Identity();  // 零四元数设为单位四元数
+      }
+      cam.rel_tvec = Eigen::Vector3d(tvec[0], tvec[1], tvec[2]);
+
+      // 建立相机ID到索引的映射，并添加到相机列表
+      rig.camera_index[cam.camera_id] = rig.cameras.size();
+      rig.cameras.push_back(cam);
+    }
+
+    // 检查rig是否包含至少一个相机
+    if (rig.cameras.empty()) {
+      if (error != nullptr) {
+        *error = "rig config has no cameras";
+      }
+      return false;
+    }
+    rig_configs->push_back(rig);
+  }
+
+  // 检查是否解析到至少一个rig配置
+  if (rig_configs->empty()) {
+    if (error != nullptr) {
+      *error = "no rig configs parsed";
+    }
+    return false;
+  }
+  return true;
 }
 
 /**
  * [功能描述]：解析一行文本，提取位姿图边(Edge)的信息
  * 支持两种格式：
- *   1. 带类型: type id1 id2 qw qx qy qz tx ty tz [is_unit rot_weight trans_weight]
+ *   1. 带类型: type(odom/loop/rig) id1 id2 qw qx qy qz tx ty tz [is_unit rot_weight trans_weight]
  *   2. 无类型: id1 id2 qw qx qy qz tx ty tz [is_unit rot_weight trans_weight] (默认为loop)
  * @param line：待解析的文本行
  * @param defaults：边的默认参数配置
@@ -333,7 +529,13 @@ bool ParseEdgeLine(const std::string& line, const EdgeDefaults& defaults,
 
   // 填充解析结果
   PoseGraphEdge parsed;
-  parsed.type = (type_token == "odom") ? EdgeType::kOdom : EdgeType::kLoop;
+  if (type_token == "odom") {
+    parsed.type = EdgeType::kOdom;
+  } else if (type_token == "rig") {
+    parsed.type = EdgeType::kRig;
+  } else {
+    parsed.type = EdgeType::kLoop;
+  }
   parsed.image_id1 = static_cast<image_t>(id1);
   parsed.image_id2 = static_cast<image_t>(id2);
   parsed.q_ij = Eigen::Quaterniond(qw, qx, qy, qz);
@@ -342,13 +544,17 @@ bool ParseEdgeLine(const std::string& line, const EdgeDefaults& defaults,
     parsed.q_ij.normalize();
   }
   Eigen::Vector3d t_ij = Eigen::Vector3d(tx, ty, tz);
-  parsed.t_ij = t_ij.normalized();  // 需要归一化，因为 loop_edges_gt.txt 中记录的平移是原始向量，没有归一化
+  parsed.t_ij = t_ij;
 
   // 根据边类型设置默认权重参数
   if (parsed.type == EdgeType::kOdom) {
     parsed.translation_is_unit = defaults.odom_translation_is_unit;
     parsed.rot_weight = defaults.odom_rot_weight;
     parsed.trans_weight = defaults.odom_trans_weight;
+  } else if (parsed.type == EdgeType::kRig) {
+    parsed.translation_is_unit = defaults.rig_translation_is_unit;
+    parsed.rot_weight = defaults.rig_rot_weight;
+    parsed.trans_weight = defaults.rig_trans_weight;
   } else {
     parsed.translation_is_unit = defaults.loop_translation_is_unit;
     parsed.rot_weight = defaults.loop_rot_weight;
@@ -726,8 +932,6 @@ bool EstimateRelativePoseFromInliers(
  * @param geom：两视图几何信息（包含内点匹配）
  * @param image_i：第一幅图像
  * @param image_j：第二幅图像
- * @param q_ij：相对旋转（从i到j）
- * @param t_ij_dir：相对平移方向（单位向量）
  * @param scale：输出参数，估计得到的尺度
  * @param q_ij_out：输出参数，估计得到的相对旋转四元数
  * @param t_ij_out：输出参数，估计得到的相对平移
@@ -736,12 +940,8 @@ bool EstimateRelativePoseFromInliers(
 bool EstimateLoopScaleFromPointPairsSim3(
     const Reconstruction& reconstruction, const TwoViewGeometry& geom,
     const Image& image_i, const Image& image_j,
-    const Eigen::Quaterniond& q_ij, const Eigen::Vector3d& t_ij_dir,
     double* scale, Eigen::Quaterniond& q_ij_out, Eigen::Vector3d& t_ij_out) {
   if (scale == nullptr) {
-    return false;
-  }
-  if (t_ij_dir.squaredNorm() < 1e-12) {
     return false;
   }
 
@@ -879,17 +1079,6 @@ bool EstimateLoopScaleFromPointPairsSim3(
   if (!R_sim3.allFinite()) {
     return false;
   }
-  // 计算相对旋转
-  const Eigen::Matrix3d R_ij = q_ij.normalized().toRotationMatrix();
-  // 计算相对旋转的余弦值
-  double cos_angle = (R_sim3 * R_ij.transpose()).trace();
-  cos_angle = (cos_angle - 1.0) * 0.5;
-  cos_angle = std::max(-1.0, std::min(1.0, cos_angle));
-  // 计算相对旋转的差值
-  const double rot_diff = std::acos(cos_angle);
-  if (!std::isfinite(rot_diff) || rot_diff > kMaxRotDiffRad) {
-    return false;
-  }
 
   // 计算相对平移的模长
   const double t_norm = t.norm();
@@ -898,12 +1087,6 @@ bool EstimateLoopScaleFromPointPairsSim3(
     return false;
   }
 
-  // 检查相对平移的余弦值是否满足最小余弦值阈值
-  const double trans_cos =
-      std::abs(t.normalized().dot(t_ij_dir.normalized()));
-  if (trans_cos < kMinAbsTransCos) {
-    return false;
-  }
   // TODO: 是否可以直接用估算出来的相对位姿来进行回环约束???
   // std::cout << "scale: " << t_norm << ", inliers: " << report.support.num_inliers << std::endl;
 
@@ -1042,6 +1225,138 @@ std::vector<PoseGraphEdge> BuildOdometryEdges(
 }
 
 /**
+ * [功能描述]：从相机rig配置构建位姿图的rig边
+ *            rig边表示同一时刻多相机系统中不同相机之间的相对位姿约束
+ * @param reconstruction：三维重建结果，包含已注册的图像信息
+ * @param rig_configs：相机rig配置列表，定义多相机系统的结构
+ * @param defaults：边的默认参数配置
+ * @param occupied_pairs：已占用的图像对集合（输入/输出），用于避免重复创建边
+ * @return 构建的rig边列表
+ */
+std::vector<PoseGraphEdge> BuildRigEdges(
+    const Reconstruction& reconstruction,
+    const std::vector<RigConfig>& rig_configs, const EdgeDefaults& defaults,
+    std::unordered_set<image_pair_t>* occupied_pairs) {
+  std::vector<PoseGraphEdge> edges;
+  if (rig_configs.empty()) {
+    return edges;
+  }
+
+  // 遍历所有相机rig配置
+  for (const auto& rig : rig_configs) {
+    // snapshots: 快照键 -> (相机ID -> 图像ID) 的映射
+    // 用于将同一时刻拍摄的多相机图像分组
+    std::unordered_map<std::string, std::unordered_map<camera_t, image_t>> snapshots;
+    snapshots.reserve(reconstruction.RegImageIds().size());
+
+    // 第一步：收集所有图像并按快照分组
+    for (const auto image_id : reconstruction.RegImageIds()) {
+      const Image& image = reconstruction.Image(image_id);
+      // 查找该图像对应的rig相机配置
+      const auto* rig_camera = FindRigCamera(rig, image.CameraId());
+      if (rig_camera == nullptr) {
+        continue;  // 该图像不属于当前rig
+      }
+      // 从图像名称中提取快照键（同一时刻拍摄的图像共享相同的快照键）
+      const std::string snapshot_key =
+          ExtractSnapshotKey(image.Name(), rig_camera->image_prefix);
+      if (snapshot_key.empty()) {
+        continue;
+      }
+      // 将图像添加到对应快照中，如果同一相机有多个图像则保留ID最小的
+      auto& snapshot = snapshots[snapshot_key];
+      auto it = snapshot.find(image.CameraId());
+      if (it == snapshot.end()) {
+        snapshot.emplace(image.CameraId(), image_id);
+      } else if (image_id < it->second) {
+        it->second = image_id;  // 保留较小的image_id
+      }
+    }
+
+    // 第二步：为每个快照中的相机对创建rig边
+    for (const auto& snapshot : snapshots) {
+      const auto& images_by_camera = snapshot.second;
+      if (images_by_camera.size() < 2) {
+        continue;  // 快照中至少需要2个相机才能构建边
+      }
+
+      // 提取当前快照中存在的所有相机ID
+      std::vector<camera_t> cameras_present;
+      cameras_present.reserve(images_by_camera.size());
+      for (const auto& entry : images_by_camera) {
+        cameras_present.push_back(entry.first);
+      }
+
+      // 对所有相机对进行组合，构建rig边
+      for (size_t i = 0; i + 1 < cameras_present.size(); ++i) {
+        const camera_t cam_i_id = cameras_present[i];
+        const auto* cam_i = FindRigCamera(rig, cam_i_id);
+        if (cam_i == nullptr) {
+          continue;
+        }
+        const image_t image_i_id = images_by_camera.at(cam_i_id);
+
+        for (size_t j = i + 1; j < cameras_present.size(); ++j) {
+          const camera_t cam_j_id = cameras_present[j];
+          const auto* cam_j = FindRigCamera(rig, cam_j_id);
+          if (cam_j == nullptr) {
+            continue;
+          }
+          const image_t image_j_id = images_by_camera.at(cam_j_id);
+
+          // 检查该图像对是否已被占用
+          const image_pair_t pair_id =
+              Database::ImagePairToPairId(image_i_id, image_j_id);
+          if (occupied_pairs != nullptr &&
+              occupied_pairs->count(pair_id) > 0) {
+            continue;
+          }
+
+          // 计算相机i到相机j的相对位姿
+          // R_i, R_j: 各相机相对于rig坐标系的旋转矩阵
+          const Eigen::Matrix3d R_i =
+              cam_i->rel_qvec.normalized().toRotationMatrix();
+          const Eigen::Matrix3d R_j =
+              cam_j->rel_qvec.normalized().toRotationMatrix();
+          // R_ij = R_j * R_i^T：从相机i到相机j的相对旋转
+          const Eigen::Matrix3d R_ij = R_j * R_i.transpose();
+          // t_ij = t_j - R_ij * t_i：从相机i到相机j的相对平移
+          const Eigen::Vector3d t_ij =
+              cam_j->rel_tvec - R_j * R_i.transpose() * cam_i->rel_tvec;
+
+          // 构建位姿图边
+          PoseGraphEdge edge;
+          edge.type = EdgeType::kRig;
+          edge.image_id1 = image_i_id;
+          edge.image_id2 = image_j_id;
+          edge.q_ij = Eigen::Quaterniond(R_ij);
+          edge.translation_is_unit = defaults.rig_translation_is_unit;
+          edge.t_ij = t_ij;
+          // 如果需要单位化平移向量
+          if (edge.translation_is_unit) {
+            const double t_norm = edge.t_ij.norm();
+            if (t_norm > 1e-12) {
+              edge.t_ij /= t_norm;
+            }
+          }
+          // 设置旋转和平移的权重
+          edge.rot_weight = defaults.rig_rot_weight;
+          edge.trans_weight = defaults.rig_trans_weight;
+
+          edges.push_back(edge);
+          // 将该图像对标记为已占用
+          if (occupied_pairs != nullptr) {
+            occupied_pairs->insert(pair_id);
+          }
+        }
+      }
+    }
+  }
+
+  return edges;
+}
+
+/**
  * [功能描述]：从数据库中的两视图几何构建回环边
  *            应用多种过滤条件筛选高质量的回环约束
  * @param reconstruction：3D重建结果
@@ -1172,11 +1487,126 @@ std::vector<PoseGraphEdge> BuildLoopEdges(
     edge.image_id1 = i;
     edge.image_id2 = j;
     edge.q_ij = q_ij;
+    edge.t_ij = t_ij_dir;
+    edge.translation_is_unit = true;
+    continue;
+    edge.rot_weight = options.defaults.loop_rot_weight;
+    edge.trans_weight = options.defaults.loop_trans_weight;
+
+    edges.push_back(edge);
+    occupied_pairs->insert(pair_id);  // 标记该对已使用
+    loop_degree[i] += 1;
+    loop_degree[j] += 1;
+  }
+
+  return edges;
+}
+
+std::vector<PoseGraphEdge> BuildLoopEdgesSim3(
+    const Reconstruction& reconstruction, Database* database,
+    const PipelineOptions& options,
+    std::unordered_set<image_pair_t>* occupied_pairs) {
+  // 从数据库读取所有两视图几何
+  std::vector<image_pair_t> image_pair_ids;
+  std::vector<TwoViewGeometry> two_view_geometries;
+  database->ReadTwoViewGeometries(&image_pair_ids, &two_view_geometries);
+
+  // 特征点缓存，避免重复读取
+  std::unordered_map<image_t, std::vector<Eigen::Vector2d>> points_cache;
+  points_cache.reserve(reconstruction.RegImageIds().size());
+
+  // 按内点数量降序排序，优先处理高质量匹配
+  std::vector<size_t> loop_indices(image_pair_ids.size());
+  std::iota(loop_indices.begin(), loop_indices.end(), 0);
+  std::sort(loop_indices.begin(), loop_indices.end(),
+            [&](size_t a, size_t b) {
+              return two_view_geometries[a].inlier_matches.size() >
+                     two_view_geometries[b].inlier_matches.size();
+            });
+
+  // 记录每个图像的回环边数量（用于限制每图最大回环数）
+  std::unordered_map<image_t, size_t> loop_degree;
+  loop_degree.reserve(reconstruction.RegImageIds().size());
+
+  const double min_tri_angle = DegToRad(options.min_loop_tri_angle_deg);
+  std::vector<PoseGraphEdge> edges;
+
+  for (const size_t idx : loop_indices) {
+    image_t i;
+    image_t j;
+    Database::PairIdToImagePair(image_pair_ids[idx], &i, &j);
+    const TwoViewGeometry& geom = two_view_geometries[idx];
+
+    // 过滤1：图像必须存在于重建中
+    if (!reconstruction.ExistsImage(i) || !reconstruction.ExistsImage(j)) {
+      continue;
+    }
+
+    // 过滤2：图像对未被占用
+    const image_pair_t pair_id = Database::ImagePairToPairId(i, j);
+    if (occupied_pairs->count(pair_id) > 0) {
+      continue;
+    }
+
+    // 过滤3：图像ID间隔足够大（避免相邻帧）
+    if (std::abs(static_cast<int>(i) - static_cast<int>(j)) <
+        options.min_loop_id_gap) {
+      continue;
+    }
+
+    // 过滤4：几何配置类型有效
+    if (geom.config == TwoViewGeometry::UNDEFINED ||
+        geom.config == TwoViewGeometry::DEGENERATE ||
+        geom.config == TwoViewGeometry::WATERMARK ||
+        geom.config == TwoViewGeometry::MULTIPLE) {
+      continue;
+    }
+
+    // 过滤5：内点数量足够
+    const size_t num_inliers = geom.inlier_matches.size();
+    if (num_inliers < options.min_loop_inliers) {
+      continue;
+    }
+
+    // 过滤6：内点比例足够高
+    const FeatureMatches matches = database->ReadMatches(i, j);
+    if (matches.empty()) {
+      continue;
+    }
+    const double inlier_ratio =
+        static_cast<double>(num_inliers) /
+        static_cast<double>(matches.size());
+    if (inlier_ratio < options.min_loop_inlier_ratio) {
+      continue;
+    }
+
+    // 过滤7：三角化角度足够大
+    if (geom.tri_angle > 0 && geom.tri_angle < min_tri_angle) {
+      continue;
+    }
+
+    // 过滤8：通过几何误差检验
+    const Image& image_i = reconstruction.Image(i);
+    const Image& image_j = reconstruction.Image(j);
+    const Camera& camera_i = reconstruction.Camera(image_i.CameraId());
+    const Camera& camera_j = reconstruction.Camera(image_j.CameraId());
+
+    // 过滤9：每个图像的回环边数量不超过上限
+    if (loop_degree[i] >= options.max_loop_edges_per_image ||
+        loop_degree[j] >= options.max_loop_edges_per_image) {
+      continue;
+    }
+
+    // 构建回环边
+    PoseGraphEdge edge;
+    edge.type = EdgeType::kLoop;
+    edge.image_id1 = i;
+    edge.image_id2 = j;
     double loop_scale = 0.0;
     Eigen::Quaterniond q_ij_sim3;
     Eigen::Vector3d t_ij_sim3;
     if (EstimateLoopScaleFromPointPairsSim3(reconstruction, geom, image_i,
-                                            image_j, q_ij, t_ij_dir,
+                                            image_j,
                                             &loop_scale, q_ij_sim3, t_ij_sim3)) {
       // 只使用尺度信息调整平移向量
       // edge.t_ij = t_ij_dir * loop_scale;
@@ -1186,8 +1616,8 @@ std::vector<PoseGraphEdge> BuildLoopEdges(
       edge.t_ij = t_ij_sim3;
       edge.translation_is_unit = false;
     } else {
-      edge.t_ij = t_ij_dir;
-      edge.translation_is_unit = true;
+      // 无法估计尺度则跳过该边
+      continue;
     }
     edge.rot_weight = options.defaults.loop_rot_weight;
     edge.trans_weight = options.defaults.loop_trans_weight;
@@ -1208,18 +1638,23 @@ std::vector<PoseGraphEdge> BuildLoopEdges(
  * @param problem：Ceres优化问题
  * @param num_loop_edges：输出参数，添加的回环边数量（可为nullptr）
  * @param num_odom_edges：输出参数，添加的里程计边数量（可为nullptr）
+ * @param num_rig_edges：输出参数，添加的rig边数量（可为nullptr）
  */
 void AddEdgesToProblem(const std::vector<PoseGraphEdge>& edges,
                        const std::unordered_map<image_t, double*>& pose_params,
                        ceres::Problem* problem,
                        size_t* num_loop_edges,
-                       size_t* num_odom_edges) {
+                       size_t* num_odom_edges,
+                       size_t* num_rig_edges) {
   // 初始化计数器
   if (num_loop_edges) {
     *num_loop_edges = 0;
   }
   if (num_odom_edges) {
     *num_odom_edges = 0;
+  }
+  if (num_rig_edges) {
+    *num_rig_edges = 0;
   }
 
   for (const auto& edge : edges) {
@@ -1245,7 +1680,7 @@ void AddEdgesToProblem(const std::vector<PoseGraphEdge>& edges,
                                              trans_weight);
     }
 
-    // 回环边使用Huber鲁棒核函数，里程计边不使用
+    // 回环边使用Huber鲁棒核函数，里程计/rig边不使用
     ceres::LossFunction* loss = nullptr;
     if (edge.type == EdgeType::kLoop) {
       loss = new ceres::HuberLoss(1.0);
@@ -1258,6 +1693,10 @@ void AddEdgesToProblem(const std::vector<PoseGraphEdge>& edges,
     if (edge.type == EdgeType::kLoop) {
       if (num_loop_edges) {
         *num_loop_edges += 1;
+      }
+    } else if (edge.type == EdgeType::kRig) {
+      if (num_rig_edges) {
+        *num_rig_edges += 1;
       }
     } else {
       if (num_odom_edges) {
@@ -1381,6 +1820,7 @@ void PrintUsage() {
          "  --edge-input <path>   Read pose-graph edges (manual recall).\n"
          "  --edge-output <path>  Write pose-graph edges.\n"
          "  --manual-loop <path>  Add manual loop edges file.\n"
+         "  --rig-config <path>   Add fixed rig constraints.\n"
          "  --skip-odom           Disable odometry edges.\n"
          "  --skip-loop           Disable auto loop edges.\n"
          "  --eval-threshold <px> Fail if mean reprojection error exceeds.\n"
@@ -1425,6 +1865,11 @@ bool ParseArgs(int argc, char** argv, PipelineOptions* options) {
     // 可选参数：手动回环边文件路径
     if (arg == "--manual-loop" && i + 1 < argc) {
       options->manual_loop_path = argv[++i];
+      continue;
+    }
+    // 可选参数：相机rig配置文件
+    if (arg == "--rig-config" && i + 1 < argc) {
+      options->rig_config_path = argv[++i];
       continue;
     }
     // 可选参数：评估阈值（像素）
@@ -1550,8 +1995,8 @@ int main(int argc, char** argv) {
   } else {
     // 自动构建里程计边
     if (options.build_odom_edges) {
-      // auto odom_edges = BuildOdometryEdges(reconstruction, options.defaults);
-      auto odom_edges = BuildOdometryEdges(reconstruction, &database, options.defaults);
+      auto odom_edges = BuildOdometryEdges(reconstruction, options.defaults);
+      // auto odom_edges = BuildOdometryEdges(reconstruction, &database, options.defaults);
       for (const auto& edge : odom_edges) {
         const image_pair_t pair_id =
             Database::ImagePairToPairId(edge.image_id1, edge.image_id2);
@@ -1560,10 +2005,25 @@ int main(int argc, char** argv) {
       edges.insert(edges.end(), odom_edges.begin(), odom_edges.end());
     }
 
+    if (!options.rig_config_path.empty()) {
+      std::vector<RigConfig> rig_configs;
+      std::string error;
+      if (!ReadRigConfigFromFile(options.rig_config_path, &rig_configs,
+                                 &error)) {
+        std::cout << "Failed to read rig config: " << error << "\n";
+        return -1;
+      }
+      auto rig_edges =
+          BuildRigEdges(reconstruction, rig_configs, options.defaults,
+                        &occupied_pairs);
+      std::cout << "Added rig edges: " << rig_edges.size() << "\n";
+      edges.insert(edges.end(), rig_edges.begin(), rig_edges.end());
+    }
+
     // 自动构建回环边
     if (options.build_loop_edges) {
       auto loop_edges =
-          BuildLoopEdges(reconstruction, &database, options, &occupied_pairs);
+          BuildLoopEdgesSim3(reconstruction, &database, options, &occupied_pairs);
       edges.insert(edges.end(), loop_edges.begin(), loop_edges.end());
     }
 
@@ -1638,7 +2098,7 @@ int main(int argc, char** argv) {
             Eigen::Quaterniond q_ij_sim3;
             Eigen::Vector3d t_ij_sim3;
             if (EstimateLoopScaleFromPointPairsSim3(
-                    reconstruction, geom, image_i, image_j, q_ij, t_ij_dir,
+                    reconstruction, geom, image_i, image_j,
                     &loop_scale, q_ij_sim3, t_ij_sim3)) {
               // 只使用尺度信息调整平移向量
               // edge.t_ij = t_ij_dir * loop_scale;
@@ -1647,9 +2107,9 @@ int main(int argc, char** argv) {
               edge.q_ij = q_ij_sim3;
               edge.t_ij = t_ij_sim3;
               edge.translation_is_unit = false;
-            } else if (edge.t_ij.squaredNorm() > 1e-12) {
-              edge.t_ij.normalize();
-              edge.translation_is_unit = true;
+            } else {
+              // 无法估计尺度则跳过该边
+              continue;
             }
           }
 
@@ -1679,13 +2139,16 @@ int main(int argc, char** argv) {
   // ========== 5. 添加边到优化问题 ==========
   size_t num_loop = 0;
   size_t num_odom = 0;
-  AddEdgesToProblem(edges, pose_params, &problem, &num_loop, &num_odom);
+  size_t num_rig = 0;
+  AddEdgesToProblem(edges, pose_params, &problem, &num_loop, &num_odom,
+                    &num_rig);
 
   // 固定第一个图像的位姿（消除规范自由度）
   const image_t root_id = reconstruction.RegImageIds().front();
   problem.SetParameterBlockConstant(pose_params[root_id]);
 
-  std::cout << "PGO edges: odom=" << num_odom << " loop=" << num_loop << "\n";
+  std::cout << "PGO edges: odom=" << num_odom << " loop=" << num_loop
+            << " rig=" << num_rig << "\n";
 
   // ========== 6. 运行Ceres求解器 ==========
   ceres::Solver::Options solver_options;
