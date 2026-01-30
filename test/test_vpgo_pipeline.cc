@@ -223,8 +223,8 @@ enum class EdgeType { kOdom, kLoop, kRig };
 struct EdgeDefaults {
   double odom_rot_weight = 2.0;
   double odom_trans_weight = 2.0;
-  double loop_rot_weight = 2.0;
-  double loop_trans_weight = 2.0;
+  double loop_rot_weight = 1.0;
+  double loop_trans_weight = 1.0;
   double rig_rot_weight = 5.0;
   double rig_trans_weight = 5.0;
   bool odom_translation_is_unit = false;
@@ -1594,6 +1594,17 @@ std::vector<PoseGraphEdge> BuildLoopEdgesSim3(
     // 过滤9：每个图像的回环边数量不超过上限
     if (loop_degree[i] >= options.max_loop_edges_per_image ||
         loop_degree[j] >= options.max_loop_edges_per_image) {
+      continue;
+    }
+
+    // 图像对的相机id必须相同
+    if (image_i.CameraId() != image_j.CameraId()) {
+      continue;
+    }
+
+    // 如果图像对在初始的重建中距离大于10m，则跳过
+    const double dist = (image_i.ProjectionCenter() - image_j.ProjectionCenter()).norm();
+    if (dist > 10.0) {
       continue;
     }
 
