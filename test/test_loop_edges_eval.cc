@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -21,7 +22,8 @@ struct LoopEdgeMeasurement {
   image_t image_id1 = kInvalidImageId;
   image_t image_id2 = kInvalidImageId;
   Eigen::Quaterniond q_ij = Eigen::Quaterniond::Identity();
-  Eigen::Vector3d t_ij_dir = Eigen::Vector3d::Zero();
+  Eigen::Vector3d t_ij = Eigen::Vector3d::Zero();
+  bool t_is_unit = true;
 };
 
 bool IsNumericToken(const std::string& token) {
@@ -74,21 +76,24 @@ bool ParseLoopEdgeLine(const std::string& line,
     type_token = "loop";
   }
 
-  if (type_token == "odom") {
+  if (type_token == "odom" || type_token == "rig") {
     return false;
   }
 
-  double t_is_unit = 1.0;
-  iss >> t_is_unit;  // optional in new format
+  double t_is_unit_value = 1.0;
+  iss >> t_is_unit_value;  // optional in new format
 
   measurement->image_id1 = static_cast<image_t>(image_id1);
   measurement->image_id2 = static_cast<image_t>(image_id2);
   measurement->q_ij = Eigen::Quaterniond(qw, qx, qy, qz);
   measurement->q_ij.normalize();
-  measurement->t_ij_dir = Eigen::Vector3d(tx, ty, tz);
-  const double t_norm = measurement->t_ij_dir.norm();
-  if (t_norm > 1e-12) {
-    measurement->t_ij_dir /= t_norm;
+  measurement->t_is_unit = std::abs(t_is_unit_value) > 0.5;
+  measurement->t_ij = Eigen::Vector3d(tx, ty, tz);
+  if (measurement->t_is_unit) {
+    const double t_norm = measurement->t_ij.norm();
+    if (t_norm > 1e-12) {
+      measurement->t_ij /= t_norm;
+    }
   }
   return true;
 }
@@ -113,6 +118,7 @@ int main(int argc, char** argv) {
   CreateDirIfNotExists(output_dir);
   const std::string gt_path = JoinPaths(output_dir, "loop_edges_gt.txt");
   const std::string err_path = JoinPaths(output_dir, "loop_edges_error.txt");
+  const std::string large_err_path = JoinPaths(output_dir, "loop_edges_large_error.txt");
 
   Reconstruction reconstruction;
   reconstruction.Read(sparse_path);
@@ -134,6 +140,13 @@ int main(int argc, char** argv) {
   std::ofstream err_file(err_path);
   if (!err_file.is_open()) {
     std::cout << "ERROR: Could not open error output at " << err_path
+              << std::endl;
+    return -1;
+  }
+
+  std::ofstream large_err_file(large_err_path);
+  if (!large_err_file.is_open()) {
+    std::cout << "ERROR: Could not open large error output at " << large_err_path
               << std::endl;
     return -1;
   }
@@ -168,19 +181,13 @@ int main(int argc, char** argv) {
     Eigen::Quaterniond q_ij_gt(qvec_ij_norm(0), qvec_ij_norm(1),
                                qvec_ij_norm(2), qvec_ij_norm(3));
 
-    Eigen::Vector3d t_ij_dir_gt = Eigen::Vector3d::Zero();
-    const double t_norm = tvec_ij.norm();
-    if (t_norm > 1e-12) {
-      t_ij_dir_gt = tvec_ij / t_norm;
-    }
-
-    // 增加一个简单的过滤,如果两张图像的相机中心距离超过10m,则跳过该边
-    // 注意: Tvec()不是相机中心位置,相机中心应使用ProjectionCenter()
-    const double dist = (image1.ProjectionCenter() - image2.ProjectionCenter()).norm();
-    if (dist > 10.0) {
-      num_skipped += 1;
-      continue;
-    }
+    // // 增加一个简单的过滤,如果两张图像的相机中心距离超过10m,则跳过该边
+    // // 注意: Tvec()不是相机中心位置,相机中心应使用ProjectionCenter()
+    // const double dist = (image1.ProjectionCenter() - image2.ProjectionCenter()).norm();
+    // if (dist > 10.0) {
+    //   num_skipped += 1;
+    //   continue;
+    // }
 
     gt_file << measurement.image_id1 << " " << measurement.image_id2 << " "
             << q_ij_gt.w() << " " << q_ij_gt.x() << " " << q_ij_gt.y() << " "
@@ -188,7 +195,7 @@ int main(int argc, char** argv) {
             << " " << tvec_ij(2) << "\n";
 
     double rot_err_deg = -1.0;
-    double trans_err_deg = -1.0;
+    double trans_err = -1.0;
 
     const double q_norm = measurement.q_ij.norm();
     if (q_norm > 1e-12) {
@@ -200,17 +207,23 @@ int main(int argc, char** argv) {
       rot_err_deg = 2.0 * std::acos(w_clamped) * 180.0 / M_PI;
     }
 
-    const double t_gt_norm = t_ij_dir_gt.norm();
-    const double t_meas_norm = measurement.t_ij_dir.norm();
-    if (t_gt_norm > 1e-12 && t_meas_norm > 1e-12) {
-      const double dot =
-          ClampDot(t_ij_dir_gt.dot(measurement.t_ij_dir) /
-                   (t_gt_norm * t_meas_norm));
-      trans_err_deg = std::acos(dot) * 180.0 / M_PI;
+    if (!measurement.t_is_unit) {
+      if (tvec_ij.squaredNorm() > 1e-24 &&
+          measurement.t_ij.squaredNorm() > 1e-24) {
+        trans_err = (measurement.t_ij - tvec_ij).norm();
+      }
     }
 
-    err_file << measurement.image_id1 << " " << measurement.image_id2 << " "
-             << rot_err_deg << " " << trans_err_deg << "\n";
+    err_file << std::fixed << std::setprecision(6) << measurement.image_id1 << " " << measurement.image_id2 << " "
+             << rot_err_deg << " " << trans_err << "\n";
+
+    // 如果旋转角度误差大于5度或平移误差大于1米,则记录到大误差文件中
+    if (rot_err_deg > 5.0 || trans_err > 1.0) {
+      large_err_file << measurement.image_id1 << " " << measurement.image_id2 << " "
+                     << measurement.q_ij.w() << " " << measurement.q_ij.x() << " " << measurement.q_ij.y() << " "
+                     << measurement.q_ij.z() << " "
+                     << measurement.t_ij(0) << " " << measurement.t_ij(1) << " " << measurement.t_ij(2) << "\n";
+    }
 
     num_written += 1;
   }
