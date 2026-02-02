@@ -246,6 +246,7 @@ struct PoseGraphEdge {
 struct PipelineOptions {
   std::string sparse_path;
   std::string database_path;
+  std::string image_path;
   std::string output_path;
   std::string edge_input_path;
   std::string edge_output_path;
@@ -1828,6 +1829,7 @@ void PrintUsage() {
       << "Usage: test_vpgo_pipeline [--self-test] "
          "sparse_path database_path output_path\n"
          "Options:\n"
+         "  --image-path <path>  Extract colors from images (optional).\n"
          "  --edge-input <path>   Read pose-graph edges (manual recall).\n"
          "  --edge-output <path>  Write pose-graph edges.\n"
          "  --manual-loop <path>  Add manual loop edges file.\n"
@@ -1888,6 +1890,11 @@ bool ParseArgs(int argc, char** argv, PipelineOptions* options) {
       options->eval_threshold_px = std::stod(argv[++i]);
       continue;
     }
+    // 可选参数：图像路径（用于颜色提取）
+    if (arg == "--image-path" && i + 1 < argc) {
+      options->image_path = argv[++i];
+      continue;
+    }
     // 未知选项报错
     if (arg.rfind("--", 0) == 0) {
       std::cout << "Unknown option: " << arg << "\n";
@@ -1932,6 +1939,117 @@ bool ParseArgs(int argc, char** argv, PipelineOptions* options) {
   //   }
   // }
 
+  return true;
+}
+
+bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database) {
+  if (reconstruction == nullptr || database == nullptr) {
+    return false;
+  }
+
+  if (reconstruction->NumRegImages() < 2) {
+    std::cout << "Need at least two registered images for triangulation.\n";
+    return false;
+  }
+
+  // 使用增量建图的默认三角化/过滤参数
+  IncrementalMapperOptions mapper_options;
+  mapper_options.ba_refine_focal_length = false;
+  mapper_options.ba_refine_principal_point = false;
+  mapper_options.ba_refine_extra_params = false;
+
+  DatabaseCache database_cache;
+  const size_t min_num_matches =
+      static_cast<size_t>(mapper_options.min_num_matches);
+  database_cache.Load(*database, min_num_matches,
+                      mapper_options.ignore_watermarks,
+                      mapper_options.image_names);
+
+  // 增量建图器
+  IncrementalMapper mapper(&database_cache);
+  mapper.BeginReconstruction(reconstruction);
+
+  const auto tri_options = mapper_options.Triangulation();
+  const auto& reg_image_ids = reconstruction->RegImageIds();
+
+  // 遍历所有已注册的图像，进行三角化
+  for (size_t i = 0; i < reg_image_ids.size(); ++i) {
+    const image_t image_id = reg_image_ids[i];
+    const auto& image = reconstruction->Image(image_id);
+
+    PrintHeading1(
+        StringPrintf("Triangulating image #%d (%d)", image_id, i));
+
+    const size_t num_existing_points3D = image.NumPoints3D();
+    std::cout << "  => Image sees " << num_existing_points3D << " / "
+              << image.NumObservations() << " points\n";
+
+    mapper.TriangulateImage(tri_options, image_id);
+
+    std::cout << "  => Triangulated "
+              << (image.NumPoints3D() - num_existing_points3D) << " points\n";
+  }
+
+  PrintHeading1("Retriangulation");
+  // 补全和合并轨迹
+  CompleteAndMergeTracks(mapper_options, &mapper);
+  std::cout << "  => Retriangulated observations: "
+            << mapper.Retriangulate(tri_options) << "\n";
+
+  auto ba_options = mapper_options.GlobalBundleAdjustment();
+  ba_options.refine_focal_length = false;
+  ba_options.refine_principal_point = false;
+  ba_options.refine_extra_params = false;
+  ba_options.refine_extrinsics = true;
+
+  // 将所有已注册的图像添加到优化中
+  BundleAdjustmentConfig ba_config;
+  for (const image_t image_id : reconstruction->RegImageIds()) {
+    ba_config.AddImage(image_id);
+  }
+
+  if (reconstruction->ComputeNumObservations() == 0) {
+    std::cout << "No observations after triangulation. Skipping BA.\n";
+  } else {
+    // 迭代优化循环
+    for (int i = 0; i < mapper_options.ba_global_max_refinements; ++i) {
+      // 过滤掉深度为负的观测点，避免BA中的退化情况
+      reconstruction->FilterObservationsWithNegativeDepth();
+
+      // 计算当前观测数量
+      const size_t num_observations = reconstruction->ComputeNumObservations();
+
+      PrintHeading1("Bundle adjustment");
+      // 执行全局BA优化
+      BundleAdjuster bundle_adjuster(ba_options, ba_config);
+      // 如果BA失败，则结束重建
+      if (!bundle_adjuster.Solve(reconstruction)) {
+        std::cout << "ERROR: bundle adjustment failed.\n";
+        mapper.EndReconstruction(true);
+        return false;
+      }
+
+      // 补全和合并轨迹，统计变化的观测数
+      size_t num_changed_observations = 0;
+      num_changed_observations +=
+          CompleteAndMergeTracks(mapper_options, &mapper);
+      // num_changed_observations += mapper.Retriangulate(tri_options);
+      num_changed_observations += FilterPoints(mapper_options, &mapper);
+      const double changed =
+          num_observations == 0
+              ? 0
+              : static_cast<double>(num_changed_observations) /
+                    static_cast<double>(num_observations);
+      std::cout << StringPrintf("  => Changed observations: %.6f", changed)
+                << std::endl;
+      if (changed < mapper_options.ba_global_max_refinement_change) {
+        break;
+      }
+    }
+  }
+
+  const bool kDiscardReconstruction = false;
+  mapper.EndReconstruction(kDiscardReconstruction);
   return true;
 }
 
@@ -2184,29 +2302,31 @@ int main(int argc, char** argv) {
     image.SetTvec(t);
   }
 
-  // // 全局BA优化
-  // BundleAdjustmentOptions ba_options;
-  // ba_options.refine_focal_length = false;
-  // ba_options.refine_principal_point = false;
+  // ========== 8. 三角化与迭代优化 ==========
+  if (!TriangulateAndOptimize(&reconstruction, &database)) {
+    return -1;
+  }
 
-  // colmap::BundleAdjustmentConfig ba_config;
-  // // 把所有已注册的 image 加进去
-  // for (const auto image_id : reconstruction.RegImageIds()) {
-  //   ba_config.AddImage(image_id);
-  // }
-
-  // colmap::BundleAdjuster bundle_adjuster(ba_options, ba_config);
-  // bundle_adjuster.Solve(&reconstruction);
-
-  // ========== 8. 评估并保存结果 ==========
+  // ========== 9. 评估并保存结果 ==========
   const double post_error = reconstruction.ComputeMeanReprojectionError();
-  std::cout << "Mean reprojection error after PGO: " << post_error << " px\n";
+  std::cout << "Mean reprojection error after triangulation/BA: "
+            << post_error << " px\n";
 
   // 检查是否超过误差阈值
   if (options.eval_threshold_px > 0.0 && post_error > options.eval_threshold_px) {
     std::cout << "ERROR: reprojection error exceeds threshold ("
               << options.eval_threshold_px << " px)\n";
     return -1;
+  }
+
+  if (!options.image_path.empty()) {
+    if (!ExistsDir(options.image_path)) {
+      std::cout << "WARNING: image_path does not exist: "
+                << options.image_path << "\n";
+    } else {
+      PrintHeading1("Extracting colors");
+      reconstruction.ExtractColorsForAllImages(options.image_path);
+    }
   }
 
   // 保存优化后的重建结果
