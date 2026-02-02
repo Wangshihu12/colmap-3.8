@@ -832,28 +832,38 @@ IncrementalMapper::AdjustLocalBundle(
   return report;
 }
 
+/**
+ * [功能描述]：执行全局光束法平差（Global Bundle Adjustment）
+ *            优化所有已注册图像的位姿和三维点坐标
+ * @param options：增量式重建的配置选项
+ * @param ba_options：光束法平差的配置选项
+ * @return 优化成功返回true，失败返回false
+ */
 bool IncrementalMapper::AdjustGlobalBundle(
     const Options& options, const BundleAdjustmentOptions& ba_options) {
   CHECK_NOTNULL(reconstruction_);
 
+  // 获取所有已注册的图像ID
   const std::vector<image_t>& reg_image_ids = reconstruction_->RegImageIds();
 
+  // 全局BA至少需要2张图像
   CHECK_GE(reg_image_ids.size(), 2) << "At least two images must be "
                                        "registered for global "
                                        "bundle-adjustment";
 
-  // Avoid degeneracies in bundle adjustment.
+  // 过滤掉深度为负的观测点，避免BA中的退化情况
   reconstruction_->FilterObservationsWithNegativeDepth();
 
-  // Configure bundle adjustment.
+  // 配置BA：将所有已注册图像添加到优化中
   BundleAdjustmentConfig ba_config;
   for (const image_t image_id : reg_image_ids) {
     ba_config.AddImage(image_id);
   }
 
+  // 添加相对位姿约束（如果有的话）
   AddRelativePoseConstraintsToConfig(&ba_config);
 
-  // Fix the existing images, if option specified.
+  // 如果指定了fix_existing_images选项，则固定已存在图像的位姿
   if (options.fix_existing_images) {
     for (const image_t image_id : reg_image_ids) {
       if (existing_image_ids_.count(image_id)) {
@@ -862,25 +872,28 @@ bool IncrementalMapper::AdjustGlobalBundle(
     }
   }
 
-  // Fix 7-DOFs of the bundle adjustment problem.
+  // 固定7个自由度（7-DOF）以消除BA问题的规范歧义
+  // 7-DOF = 3旋转 + 3平移 + 1尺度
   const bool has_rel_constraints =
       ba_config.NumRelativePoseConstraints() > 0;
+  // 固定第一张图像的完整位姿（6-DOF：3旋转+3平移）
   ba_config.SetConstantPose(reg_image_ids[0]);
+  // 如果没有相对位姿约束，还需固定第二张图像的一个平移分量以固定尺度（1-DOF）
   if (!has_rel_constraints &&
       (!options.fix_existing_images ||
        !existing_image_ids_.count(reg_image_ids[1]))) {
-    ba_config.SetConstantTvec(reg_image_ids[1], {0});
+    ba_config.SetConstantTvec(reg_image_ids[1], {0});  // 固定x方向平移
   }
 
-  // Run bundle adjustment.
+  // 执行光束法平差
   BundleAdjuster bundle_adjuster(ba_options, ba_config);
   if (!bundle_adjuster.Solve(reconstruction_)) {
     return false;
   }
 
+  // 如果指定了场景归一化选项，则对场景进行归一化
+  // 目的是提高数值稳定性，避免在可视化时出现大尺度变化
   if (options.normalize_scene) {
-    // Normalize scene for numerical stability and
-    // to avoid large scale changes in viewer.
     reconstruction_->Normalize();
   }
 

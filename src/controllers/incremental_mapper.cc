@@ -54,33 +54,54 @@ size_t TriangulateImage(const IncrementalMapperOptions& options,
   return num_tris;
 }
 
+/**
+ * [功能描述]：执行全局光束法平差，根据条件选择并行BA或普通BA
+ * @param options：增量式建图的配置选项
+ * @param mapper：增量式建图器指针
+ */
 void AdjustGlobalBundle(const IncrementalMapperOptions& options,
                         IncrementalMapper* mapper) {
+  // 获取全局BA的配置选项
   BundleAdjustmentOptions custom_ba_options = options.GlobalBundleAdjustment();
 
+  // 获取当前已注册的图像数量
   const size_t num_reg_images = mapper->GetReconstruction().NumRegImages();
 
-  // Use stricter convergence criteria for first registered images.
+  // 对于前几张图像，使用更严格的收敛准则
+  // 因为初始阶段的精度对后续重建质量影响较大
   const size_t kMinNumRegImagesForFastBA = 10;
   if (num_reg_images < kMinNumRegImagesForFastBA) {
-    custom_ba_options.solver_options.function_tolerance /= 10;
-    custom_ba_options.solver_options.gradient_tolerance /= 10;
-    custom_ba_options.solver_options.parameter_tolerance /= 10;
+    // 收紧各项容差阈值（缩小10倍）
+    custom_ba_options.solver_options.function_tolerance /= 10;   // 函数值容差
+    custom_ba_options.solver_options.gradient_tolerance /= 10;   // 梯度容差
+    custom_ba_options.solver_options.parameter_tolerance /= 10;  // 参数容差
+    // 增加迭代次数以确保充分收敛
     custom_ba_options.solver_options.max_num_iterations *= 2;
     custom_ba_options.solver_options.max_linear_solver_iterations = 200;
   }
 
   PrintHeading1("Global bundle adjustment");
+
+  // 判断是否使用并行BA（PBA）
+  // 需同时满足以下条件：
+  // 1. 用户启用了并行BA选项
+  // 2. 未固定已有图像的位姿
+  // 3. 未使用外部相对位姿约束文件
+  // 4. 未从数据库读取相对位姿约束
+  // 5. 已注册图像数量达到阈值
+  // 6. 当前重建满足并行BA的支持条件
   if (options.ba_global_use_pba && !options.fix_existing_images &&
       options.relative_pose_path.empty() &&
       !options.relative_pose_from_database &&
       num_reg_images >= kMinNumRegImagesForFastBA &&
       ParallelBundleAdjuster::IsSupported(custom_ba_options,
                                           mapper->GetReconstruction())) {
+    // 使用GPU加速的并行BA
     mapper->AdjustParallelGlobalBundle(
         options.Mapper(), custom_ba_options,
         options.ParallelGlobalBundleAdjustment());
   } else {
+    // 使用CPU的普通BA
     mapper->AdjustGlobalBundle(options.Mapper(), custom_ba_options);
   }
 }
@@ -148,31 +169,54 @@ void IterativeLocalRefinement(const IncrementalMapperOptions& options,
   mapper->ClearModifiedPoints3D();
 }
 
+/**
+ * [功能描述]：迭代式全局优化，交替执行BA、轨迹补全/合并、点过滤
+ *            直到观测变化率低于阈值或达到最大迭代次数
+ * @param options：增量式建图的配置选项
+ * @param mapper：增量式建图器指针
+ */
 void IterativeGlobalRefinement(const IncrementalMapperOptions& options,
                                IncrementalMapper* mapper) {
   PrintHeading1("Retriangulation");
+
+  // 初始阶段：先完成轨迹补全和合并
   CompleteAndMergeTracks(options, mapper);
+
+  // 执行重三角化，恢复之前可能失败的三维点
   std::cout << "  => Retriangulated observations: "
             << mapper->Retriangulate(options.Triangulation()) << std::endl;
 
+  // 迭代优化循环
   for (int i = 0; i < options.ba_global_max_refinements; ++i) {
+    // 记录当前观测数量，用于计算变化率
     const size_t num_observations =
         mapper->GetReconstruction().ComputeNumObservations();
     size_t num_changed_observations = 0;
+
+    // 步骤1：执行全局BA优化
     AdjustGlobalBundle(options, mapper);
+
+    // 步骤2：补全和合并轨迹，统计变化的观测数
     num_changed_observations += CompleteAndMergeTracks(options, mapper);
+
+    // 步骤3：过滤不良三维点，统计变化的观测数
     num_changed_observations += FilterPoints(options, mapper);
+
+    // 计算观测变化率
     const double changed =
         num_observations == 0
             ? 0
             : static_cast<double>(num_changed_observations) / num_observations;
     std::cout << StringPrintf("  => Changed observations: %.6f", changed)
               << std::endl;
+
+    // 如果变化率低于阈值，说明已收敛，提前退出
     if (changed < options.ba_global_max_refinement_change) {
       break;
     }
   }
 
+  // 最后过滤不良图像
   FilterImages(options, mapper);
 }
 
@@ -427,16 +471,26 @@ size_t FilterImages(const IncrementalMapperOptions& options,
   return num_filtered_images;
 }
 
+/**
+ * [功能描述]：补全和合并特征轨迹
+ * @param options：增量式建图的配置选项
+ * @param mapper：增量式建图器指针
+ * @return 补全和合并的观测总数
+ */
 size_t CompleteAndMergeTracks(const IncrementalMapperOptions& options,
                               IncrementalMapper* mapper) {
+  // 补全轨迹：为已有三维点添加更多的二维观测
   const size_t num_completed_observations =
       mapper->CompleteTracks(options.Triangulation());
   std::cout << "  => Completed observations: " << num_completed_observations
             << std::endl;
+
+  // 合并轨迹：将指向同一三维点的不同轨迹合并
   const size_t num_merged_observations =
       mapper->MergeTracks(options.Triangulation());
   std::cout << "  => Merged observations: " << num_merged_observations
             << std::endl;
+
   return num_completed_observations + num_merged_observations;
 }
 

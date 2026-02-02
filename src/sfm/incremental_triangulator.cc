@@ -244,13 +244,21 @@ size_t IncrementalTriangulator::CompleteTracks(
   return num_completed;
 }
 
+/**
+ * [功能描述]：补全所有三维点的特征轨迹
+ *            为每个已有三维点尝试添加更多的二维观测
+ * @param options：三角化配置选项
+ * @return 成功补全的观测数量
+ */
 size_t IncrementalTriangulator::CompleteAllTracks(const Options& options) {
   CHECK(options.Check());
 
   size_t num_completed = 0;
 
+  // 清除缓存，确保使用最新数据
   ClearCaches();
 
+  // 遍历所有三维点，逐个尝试补全其轨迹
   for (const point3D_t point3D_id : reconstruction_->Point3DIds()) {
     num_completed += Complete(options, point3D_id);
   }
@@ -287,6 +295,11 @@ size_t IncrementalTriangulator::MergeAllTracks(const Options& options) {
   return num_merged;
 }
 
+/**
+ * [功能描述]：重三角化，对欠重建的图像对尝试恢复更多三维点
+ * @param options：三角化配置选项
+ * @return 成功三角化的新观测数量
+ */
 size_t IncrementalTriangulator::Retriangulate(const Options& options) {
   CHECK(options.Check());
 
@@ -294,20 +307,22 @@ size_t IncrementalTriangulator::Retriangulate(const Options& options) {
 
   ClearCaches();
 
+  // 复制配置并使用重三角化专用的角度误差阈值
   Options re_options = options;
   re_options.continue_max_angle_error = options.re_max_angle_error;
 
+  // 遍历所有图像对
   for (const auto& image_pair : reconstruction_->ImagePairs()) {
-    // Only perform retriangulation for under-reconstructed image pairs.
+    // 只对欠重建的图像对进行重三角化
+    // 计算已三角化匹配点占总匹配点的比例
     const double tri_ratio =
         static_cast<double>(image_pair.second.num_tri_corrs) /
         static_cast<double>(image_pair.second.num_total_corrs);
     if (tri_ratio >= options.re_min_ratio) {
-      continue;
+      continue;  // 已三角化比例足够高，跳过
     }
 
-    // Check if images are registered yet.
-
+    // 检查两张图像是否都已注册
     image_t image_id1;
     image_t image_id2;
     Database::PairIdToImagePair(image_pair.first, &image_id1, &image_id2);
@@ -322,14 +337,14 @@ size_t IncrementalTriangulator::Retriangulate(const Options& options) {
       continue;
     }
 
-    // Only perform retriangulation for a maximum number of trials.
-
+    // 限制每个图像对的重三角化尝试次数
     int& num_re_trials = re_num_trials_[image_pair.first];
     if (num_re_trials >= options.re_max_trials) {
       continue;
     }
     num_re_trials += 1;
 
+    // 检查相机参数是否有效
     const Camera& camera1 = reconstruction_->Camera(image1.CameraId());
     const Camera& camera2 = reconstruction_->Camera(image2.CameraId());
     if (HasCameraBogusParams(options, camera1) ||
@@ -337,25 +352,24 @@ size_t IncrementalTriangulator::Retriangulate(const Options& options) {
       continue;
     }
 
-    // Find correspondences and perform retriangulation.
-
+    // 获取两张图像之间的特征匹配
     const FeatureMatches& corrs =
         correspondence_graph_->FindCorrespondencesBetweenImages(image_id1,
                                                                 image_id2);
 
+    // 遍历每对匹配的特征点
     for (const auto& corr : corrs) {
       const Point2D& point2D1 = image1.Point2D(corr.point2D_idx1);
       const Point2D& point2D2 = image2.Point2D(corr.point2D_idx2);
 
-      // Two cases are possible here: both points belong to the same 3D point
-      // or to different 3D points. In the former case, there is nothing
-      // to do. In the latter case, we do not attempt retriangulation,
-      // as retriangulated correspondences are very likely bogus and
-      // would therefore destroy both 3D points if merged.
+      // 如果两个点都已关联三维点，则跳过
+      // 情况1：属于同一三维点，无需处理
+      // 情况2：属于不同三维点，不尝试合并（可能是错误匹配）
       if (point2D1.HasPoint3D() && point2D2.HasPoint3D()) {
         continue;
       }
 
+      // 构建第一个匹配点的数据结构
       CorrData corr_data1;
       corr_data1.image_id = image_id1;
       corr_data1.point2D_idx = corr.point2D_idx1;
@@ -363,6 +377,7 @@ size_t IncrementalTriangulator::Retriangulate(const Options& options) {
       corr_data1.camera = &camera1;
       corr_data1.point2D = &point2D1;
 
+      // 构建第二个匹配点的数据结构
       CorrData corr_data2;
       corr_data2.image_id = image_id2;
       corr_data2.point2D_idx = corr.point2D_idx2;
@@ -370,20 +385,22 @@ size_t IncrementalTriangulator::Retriangulate(const Options& options) {
       corr_data2.camera = &camera2;
       corr_data2.point2D = &point2D2;
 
+      // 根据两个点的三维点关联状态，选择不同的处理方式
       if (point2D1.HasPoint3D() && !point2D2.HasPoint3D()) {
+        // 情况A：点1有三维点，点2没有 -> 尝试将点2添加到点1的三维点
         const std::vector<CorrData> corrs_data1 = {corr_data1};
         num_tris += Continue(re_options, corr_data2, corrs_data1);
       } else if (!point2D1.HasPoint3D() && point2D2.HasPoint3D()) {
+        // 情况B：点2有三维点，点1没有 -> 尝试将点1添加到点2的三维点
         const std::vector<CorrData> corrs_data2 = {corr_data2};
         num_tris += Continue(re_options, corr_data1, corrs_data2);
       } else if (!point2D1.HasPoint3D() && !point2D2.HasPoint3D()) {
+        // 情况C：两点都没有三维点 -> 创建新的三维点
         const std::vector<CorrData> corrs_data = {corr_data1, corr_data2};
-        // Do not use larger triangulation threshold as this causes
-        // significant drift when creating points (options vs. re_options).
+        // 注意：创建新点时使用原始options而非re_options，避免漂移
         num_tris += Create(options, corrs_data);
       }
-      // Else both points have a 3D point, but we do not want to
-      // merge points in retriangulation.
+      // 情况D：两点都有三维点，已在上面跳过
     }
   }
 
