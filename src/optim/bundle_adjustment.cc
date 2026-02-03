@@ -833,22 +833,31 @@ RigBundleAdjuster::RigBundleAdjuster(const BundleAdjustmentOptions& options,
                                      const BundleAdjustmentConfig& config)
     : BundleAdjuster(options, config), rig_options_(rig_options) {}
 
+/**
+ * [功能描述]：执行相机Rig的光束法平差
+ *            同时优化重建结果和相机rig的相对位姿
+ * @param reconstruction：三维重建结果（输入/输出）
+ * @param camera_rigs：相机rig配置列表（输入/输出）
+ * @return 优化成功返回true，失败返回false
+ */
 bool RigBundleAdjuster::Solve(Reconstruction* reconstruction,
                               std::vector<CameraRig>* camera_rigs) {
   CHECK_NOTNULL(reconstruction);
   CHECK_NOTNULL(camera_rigs);
   CHECK(!problem_) << "Cannot use the same BundleAdjuster multiple times";
 
-  // Check the validity of the provided camera rigs.
+  // 验证相机rig配置的有效性
   std::unordered_set<camera_t> rig_camera_ids;
   for (auto& camera_rig : *camera_rigs) {
     camera_rig.Check(*reconstruction);
+    // 检查每个相机只能属于一个rig
     for (const auto& camera_id : camera_rig.GetCameraIds()) {
       CHECK_EQ(rig_camera_ids.count(camera_id), 0)
           << "Camera must not be part of multiple camera rigs";
       rig_camera_ids.insert(camera_id);
     }
 
+    // 建立图像ID到相机rig的映射，同时检查图像不能属于多个rig
     for (const auto& snapshot : camera_rig.Snapshots()) {
       for (const auto& image_id : snapshot) {
         CHECK_EQ(image_id_to_camera_rig_.count(image_id), 0)
@@ -858,32 +867,40 @@ bool RigBundleAdjuster::Solve(Reconstruction* reconstruction,
     }
   }
 
+  // 创建Ceres优化问题
   problem_ = std::make_unique<ceres::Problem>();
 
+  // 创建损失函数并设置优化问题
   ceres::LossFunction* loss_function = options_.CreateLossFunction();
   SetUp(reconstruction, camera_rigs, loss_function);
 
+  // 如果没有残差项则直接返回
   if (problem_->NumResiduals() == 0) {
     return false;
   }
 
+  // 配置求解器选项
   ceres::Solver::Options solver_options = options_.solver_options;
   const bool has_sparse =
       solver_options.sparse_linear_algebra_library_type != ceres::NO_SPARSE;
 
-  // Empirical choice.
-  const size_t kMaxNumImagesDirectDenseSolver = 50;
-  const size_t kMaxNumImagesDirectSparseSolver = 1000;
+  // 根据图像数量选择合适的线性求解器（经验阈值）
+  const size_t kMaxNumImagesDirectDenseSolver = 50;    // 稠密求解器阈值
+  const size_t kMaxNumImagesDirectSparseSolver = 1000; // 稀疏求解器阈值
   const size_t num_images = config_.NumImages();
   if (num_images <= kMaxNumImagesDirectDenseSolver) {
+    // 小规模问题：使用稠密Schur消元
     solver_options.linear_solver_type = ceres::DENSE_SCHUR;
   } else if (num_images <= kMaxNumImagesDirectSparseSolver && has_sparse) {
+    // 中等规模问题：使用稀疏Schur消元
     solver_options.linear_solver_type = ceres::SPARSE_SCHUR;
-  } else {  // Indirect sparse (preconditioned CG) solver.
+  } else {
+    // 大规模问题：使用迭代式Schur消元（预条件共轭梯度法）
     solver_options.linear_solver_type = ceres::ITERATIVE_SCHUR;
     solver_options.preconditioner_type = ceres::SCHUR_JACOBI;
   }
 
+  // 设置有效的线程数
   solver_options.num_threads =
       GetEffectiveNumThreads(solver_options.num_threads);
 #if CERES_VERSION_MAJOR < 2
@@ -891,20 +908,24 @@ bool RigBundleAdjuster::Solve(Reconstruction* reconstruction,
       GetEffectiveNumThreads(solver_options.num_linear_solver_threads);
 #endif  // CERES_VERSION_MAJOR
 
+  // 验证求解器配置
   std::string solver_error;
   CHECK(solver_options.IsValid(&solver_error)) << solver_error;
 
+  // 执行优化求解
   ceres::Solve(solver_options, problem_.get(), &summary_);
 
   if (solver_options.minimizer_progress_to_stdout) {
     std::cout << std::endl;
   }
 
+  // 打印优化报告
   if (options_.print_summary) {
     PrintHeading2("Rig Bundle adjustment report");
     PrintSolverSummary(summary_);
   }
 
+  // 将优化结果写回重建数据和相机rig
   TearDown(reconstruction, *camera_rigs);
 
   return true;
@@ -944,40 +965,57 @@ void RigBundleAdjuster::TearDown(Reconstruction* reconstruction,
   }
 }
 
+/**
+ * [功能描述]：将单张图像的观测添加到Rig BA优化问题中
+ *            支持普通图像和属于相机rig的图像两种情况
+ * @param image_id：要添加的图像ID
+ * @param reconstruction：三维重建结果
+ * @param camera_rigs：相机rig配置列表
+ * @param loss_function：鲁棒损失函数
+ */
 void RigBundleAdjuster::AddImageToProblem(const image_t image_id,
                                           Reconstruction* reconstruction,
                                           std::vector<CameraRig>* camera_rigs,
                                           ceres::LossFunction* loss_function) {
+  // 计算最大重投影误差平方（用于过滤外点）
   const double max_squared_reproj_error =
       rig_options_.max_reproj_error * rig_options_.max_reproj_error;
 
   Image& image = reconstruction->Image(image_id);
   Camera& camera = reconstruction->Camera(image.CameraId());
 
+  // 检查该图像是否有固定的位姿约束
   const bool constant_pose = config_.HasConstantPose(image_id);
   const bool constant_tvec = config_.HasConstantTvec(image_id);
 
-  double* qvec_data = nullptr;
-  double* tvec_data = nullptr;
-  double* rig_qvec_data = nullptr;
-  double* rig_tvec_data = nullptr;
-  double* camera_params_data = camera.ParamsData();
+  // 初始化待优化的参数指针
+  double* qvec_data = nullptr;           // 旋转四元数（图像位姿或相对位姿）
+  double* tvec_data = nullptr;           // 平移向量（图像位姿或相对位姿）
+  double* rig_qvec_data = nullptr;       // rig的绝对旋转
+  double* rig_tvec_data = nullptr;       // rig的绝对平移
+  double* camera_params_data = camera.ParamsData();  // 相机内参
   CameraRig* camera_rig = nullptr;
   Eigen::Matrix3x4d rig_proj_matrix = Eigen::Matrix3x4d::Zero();
 
+  // 判断该图像是否属于某个相机rig
   if (image_id_to_camera_rig_.count(image_id) > 0) {
+    // === 情况1：图像属于相机rig ===
+    // rig中的图像不能有固定位姿（因为位姿由rig位姿+相对位姿计算）
     CHECK(!constant_pose)
         << "Images contained in a camera rig must not have constant pose";
     CHECK(!constant_tvec)
         << "Images contained in a camera rig must not have constant tvec";
+
     camera_rig = image_id_to_camera_rig_.at(image_id);
+    // 获取rig的绝对位姿指针
     rig_qvec_data = image_id_to_rig_qvec_.at(image_id)->data();
     rig_tvec_data = image_id_to_rig_tvec_.at(image_id)->data();
+    // 获取相机在rig中的相对位姿指针
     qvec_data = camera_rig->RelativeQvec(image.CameraId()).data();
     tvec_data = camera_rig->RelativeTvec(image.CameraId()).data();
 
-    // Concatenate the absolute pose of the rig and the relative pose the camera
-    // within the rig to detect outlier observations.
+    // 计算相机的完整位姿 = rig绝对位姿 ⊕ 相机相对位姿
+    // 用于外点检测
     Eigen::Vector4d rig_concat_qvec;
     Eigen::Vector3d rig_concat_tvec;
     ConcatenatePoses(*image_id_to_rig_qvec_.at(image_id),
@@ -987,21 +1025,23 @@ void RigBundleAdjuster::AddImageToProblem(const image_t image_id,
                      &rig_concat_qvec, &rig_concat_tvec);
     rig_proj_matrix = ComposeProjectionMatrix(rig_concat_qvec, rig_concat_tvec);
   } else {
-    // CostFunction assumes unit quaternions.
+    // === 情况2：普通图像（不属于rig）===
+    // 归一化四元数（Ceres代价函数要求单位四元数）
     image.NormalizeQvec();
     qvec_data = image.Qvec().data();
     tvec_data = image.Tvec().data();
   }
 
-  // Collect cameras for final parameterization.
+  // 记录相机ID，用于后续参数化设置
   CHECK(image.HasCamera());
   camera_ids_.insert(image.CameraId());
 
-  // The number of added observations for the current image.
+  // 当前图像添加的观测数量
   size_t num_observations = 0;
 
-  // Add residuals to bundle adjustment problem.
+  // 遍历图像中的所有二维特征点，添加重投影残差
   for (const Point2D& point2D : image.Points2D()) {
+    // 跳过未关联三维点的特征
     if (!point2D.HasPoint3D()) {
       continue;
     }
@@ -1009,6 +1049,7 @@ void RigBundleAdjuster::AddImageToProblem(const image_t image_id,
     Point3D& point3D = reconstruction->Point3D(point2D.Point3DId());
     assert(point3D.Track().Length() > 1);
 
+    // 对于rig图像，过滤重投影误差过大的外点
     if (camera_rig != nullptr &&
         CalculateSquaredReprojectionError(point2D.XY(), point3D.XYZ(),
                                           rig_proj_matrix,
@@ -1022,7 +1063,9 @@ void RigBundleAdjuster::AddImageToProblem(const image_t image_id,
     ceres::CostFunction* cost_function = nullptr;
 
     if (camera_rig == nullptr) {
+      // === 普通图像的代价函数 ===
       if (constant_pose) {
+        // 位姿固定：只优化三维点和相机内参
         switch (camera.ModelId()) {
 #define CAMERA_MODEL_CASE(CameraModel)                                 \
   case CameraModel::kModelId:                                          \
@@ -1039,6 +1082,7 @@ void RigBundleAdjuster::AddImageToProblem(const image_t image_id,
         problem_->AddResidualBlock(cost_function, loss_function,
                                    point3D.XYZ().data(), camera_params_data);
       } else {
+        // 位姿可变：优化位姿、三维点和相机内参
         switch (camera.ModelId()) {
 #define CAMERA_MODEL_CASE(CameraModel)                                   \
   case CameraModel::kModelId:                                            \
@@ -1056,6 +1100,8 @@ void RigBundleAdjuster::AddImageToProblem(const image_t image_id,
                                    camera_params_data);
       }
     } else {
+      // === Rig图像的代价函数 ===
+      // 优化变量：rig绝对位姿、相机相对位姿、三维点、相机内参
       switch (camera.ModelId()) {
 #define CAMERA_MODEL_CASE(CameraModel)                                      \
   case CameraModel::kModelId:                                               \
@@ -1074,15 +1120,17 @@ void RigBundleAdjuster::AddImageToProblem(const image_t image_id,
     }
   }
 
+  // 如果成功添加了观测，设置参数化约束
   if (num_observations > 0) {
+    // 记录需要参数化的四元数（用于添加流形约束）
     parameterized_qvec_data_.insert(qvec_data);
 
     if (camera_rig != nullptr) {
       parameterized_qvec_data_.insert(rig_qvec_data);
 
-      // Set the relative pose of the camera constant if relative pose
-      // refinement is disabled or if it is the reference camera to avoid over-
-      // parameterization of the camera pose.
+      // 固定相机相对位姿的情况：
+      // 1. 禁用相对位姿优化
+      // 2. 参考相机（避免过参数化，因为rig位姿已包含6个自由度）
       if (!rig_options_.refine_relative_poses ||
           image.CameraId() == camera_rig->RefCameraId()) {
         problem_->SetParameterBlockConstant(qvec_data);
@@ -1090,7 +1138,7 @@ void RigBundleAdjuster::AddImageToProblem(const image_t image_id,
       }
     }
 
-    // Set pose parameterization.
+    // 如果只固定部分平移分量，设置子集流形
     if (!constant_pose && constant_tvec) {
       const std::vector<int>& constant_tvec_idxs =
           config_.ConstantTvec(image_id);
@@ -1150,23 +1198,43 @@ void RigBundleAdjuster::AddPointToProblem(const point3D_t point3D_id,
   }
 }
 
+/**
+ * [功能描述]：计算每个相机rig在每个快照时刻的绝对位姿
+ *            并建立图像ID到rig位姿的映射关系
+ * @param reconstruction：三维重建结果
+ * @param camera_rigs：相机rig配置列表
+ */
 void RigBundleAdjuster::ComputeCameraRigPoses(
     const Reconstruction& reconstruction,
     const std::vector<CameraRig>& camera_rigs) {
+  // 预分配存储空间
+  // camera_rig_qvecs_[rig_idx][snapshot_idx] = rig在该快照的旋转四元数
+  // camera_rig_tvecs_[rig_idx][snapshot_idx] = rig在该快照的平移向量
   camera_rig_qvecs_.reserve(camera_rigs.size());
   camera_rig_tvecs_.reserve(camera_rigs.size());
+
+  // 遍历每个相机rig
   for (const auto& camera_rig : camera_rigs) {
+    // 为当前rig添加位姿存储容器
     camera_rig_qvecs_.emplace_back();
     camera_rig_tvecs_.emplace_back();
     auto& rig_qvecs = camera_rig_qvecs_.back();
     auto& rig_tvecs = camera_rig_tvecs_.back();
+
+    // 为每个快照分配位姿存储空间
     rig_qvecs.resize(camera_rig.NumSnapshots());
     rig_tvecs.resize(camera_rig.NumSnapshots());
+
+    // 遍历每个快照，计算rig的绝对位姿
     for (size_t snapshot_idx = 0; snapshot_idx < camera_rig.NumSnapshots();
          ++snapshot_idx) {
+      // 根据快照中各图像的位姿，计算rig的绝对位姿（取平均）
       camera_rig.ComputeAbsolutePose(snapshot_idx, reconstruction,
                                      &rig_qvecs[snapshot_idx],
                                      &rig_tvecs[snapshot_idx]);
+
+      // 建立该快照中所有图像到rig位姿的映射
+      // 同一快照内的图像共享同一个rig位姿（用于BA优化）
       for (const auto image_id : camera_rig.Snapshots()[snapshot_idx]) {
         image_id_to_rig_qvec_.emplace(image_id, &rig_qvecs[snapshot_idx]);
         image_id_to_rig_tvec_.emplace(image_id, &rig_tvecs[snapshot_idx]);
