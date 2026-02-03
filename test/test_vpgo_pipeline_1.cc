@@ -149,7 +149,6 @@ struct SE3RelativePoseCostFull {
   double trans_weight_;
 };
 
-// 不同相机，不同时间快照
 struct SE3RelativePoseCostRig {
   SE3RelativePoseCostRig(const Eigen::Quaterniond& q_ij,
                          const Eigen::Vector3d& t_ij_unit, double rot_weight,
@@ -176,7 +175,7 @@ struct SE3RelativePoseCostRig {
     const Eigen::Quaternion<T> q_ij = q_ij_.cast<T>();
     const Eigen::Matrix<T, 3, 1> t_ij_obs = t_ij_unit_.cast<T>();
 
-    // 计算相机i和相机j的绝对位姿: rel * base
+    // Compose absolute poses: base ⊕ rel (same convention as ConcatenatePoses).
     const Eigen::Quaternion<T> q_i = q_rel_i * q_base_i;
     const Eigen::Matrix<T, 3, 1> t_i = t_rel_i + q_rel_i * t_base_i;
     const Eigen::Quaternion<T> q_j = q_rel_j * q_base_j;
@@ -218,7 +217,6 @@ struct SE3RelativePoseCostRig {
   double trans_weight_;
 };
 
-// 不同相机，不同时间快照
 struct SE3RelativePoseCostRigFull {
   SE3RelativePoseCostRigFull(const Eigen::Quaterniond& q_ij,
                              const Eigen::Vector3d& t_ij, double rot_weight,
@@ -245,7 +243,7 @@ struct SE3RelativePoseCostRigFull {
     const Eigen::Quaternion<T> q_ij = q_ij_.cast<T>();
     const Eigen::Matrix<T, 3, 1> t_ij_obs = t_ij_.cast<T>();
 
-    // 计算相机i和相机j的绝对位姿: rel * base
+    // Compose absolute poses: base ⊕ rel (same convention as ConcatenatePoses).
     const Eigen::Quaternion<T> q_i = q_rel_i * q_base_i;
     const Eigen::Matrix<T, 3, 1> t_i = t_rel_i + q_rel_i * t_base_i;
     const Eigen::Quaternion<T> q_j = q_rel_j * q_base_j;
@@ -285,7 +283,6 @@ struct SE3RelativePoseCostRigFull {
   double trans_weight_;
 };
 
-// 同一相机，不同时间快照，共享 rel_pose
 struct SE3RelativePoseCostRigSharedRel {
   SE3RelativePoseCostRigSharedRel(const Eigen::Quaterniond& q_ij,
                                   const Eigen::Vector3d& t_ij_unit,
@@ -350,7 +347,6 @@ struct SE3RelativePoseCostRigSharedRel {
   double trans_weight_;
 };
 
-// 同一相机，不同时间快照，共享 rel_pose
 struct SE3RelativePoseCostRigSharedRelFull {
   SE3RelativePoseCostRigSharedRelFull(const Eigen::Quaterniond& q_ij,
                                       const Eigen::Vector3d& t_ij,
@@ -413,7 +409,6 @@ struct SE3RelativePoseCostRigSharedRelFull {
   double trans_weight_;
 };
 
-// 同一时间快照，不同相机，共享 base_pose
 struct SE3RelativePoseCostRigSharedBase {
   SE3RelativePoseCostRigSharedBase(const Eigen::Quaterniond& q_ij,
                                    const Eigen::Vector3d& t_ij_unit,
@@ -478,7 +473,6 @@ struct SE3RelativePoseCostRigSharedBase {
   double trans_weight_;
 };
 
-// 同一时间快照，不同相机，共享 base_pose
 struct SE3RelativePoseCostRigSharedBaseFull {
   SE3RelativePoseCostRigSharedBaseFull(const Eigen::Quaterniond& q_ij,
                                        const Eigen::Vector3d& t_ij,
@@ -638,8 +632,8 @@ struct PoseGraphEdge {
 };
 
 struct ImagePoseParams {
-  double* base_pose = nullptr;  // 不同快照下的相机基准位姿
-  double* rel_pose = nullptr;   // 统一快照，不同相机的相对位姿
+  double* base_pose = nullptr;  // rig pose (per snapshot) or image pose
+  double* rel_pose = nullptr;   // camera rel pose or identity
 };
 
 struct PipelineOptions {
@@ -2111,7 +2105,7 @@ void AddEdgesToProblem(const std::vector<PoseGraphEdge>& edges,
     const bool same_base = it1->second.base_pose == it2->second.base_pose;
     const bool same_rel = it1->second.rel_pose == it2->second.rel_pose;
     if (same_base && same_rel) {
-      // 同一快照，同一相机，跳过该边
+      // Same parameter blocks for both endpoints; skip to avoid invalid residual.
       continue;
     }
     if (edge.translation_is_unit) {
@@ -2919,11 +2913,11 @@ int main(int argc, char** argv) {
     image.SetTvec(t);
   }
 
-  // ========== 9. 三角化与迭代优化 ==========
-  if (!TriangulateAndOptimize(&reconstruction, &database,
-                              options.rig_config_path)) {
-    return -1;
-  }
+  // // ========== 9. 三角化与迭代优化 ==========
+  // if (!TriangulateAndOptimize(&reconstruction, &database,
+  //                             options.rig_config_path)) {
+  //   return -1;
+  // }
 
   // ========== 10. 评估并保存结果 ==========
   const double post_error = reconstruction.ComputeMeanReprojectionError();
