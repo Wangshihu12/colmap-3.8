@@ -17,6 +17,7 @@
 
 #include <ceres/ceres.h>
 
+#include "base/camera_rig.h"
 #include "base/database.h"
 #include "base/pose.h"
 #include "base/reconstruction.h"
@@ -281,63 +282,6 @@ std::string EdgeTypeToString(const EdgeType type) {
   return "loop";
 }
 
-struct RigCameraConfig {
-  camera_t camera_id = kInvalidCameraId;
-  std::string image_prefix;
-  Eigen::Quaterniond rel_qvec = Eigen::Quaterniond::Identity();
-  Eigen::Vector3d rel_tvec = Eigen::Vector3d::Zero();
-};
-
-struct RigConfig {
-  camera_t ref_camera_id = kInvalidCameraId;
-  std::vector<RigCameraConfig> cameras;
-  std::unordered_map<camera_t, size_t> camera_index;
-};
-
-const RigCameraConfig* FindRigCamera(const RigConfig& rig,
-                                     const camera_t camera_id) {
-  const auto it = rig.camera_index.find(camera_id);
-  if (it == rig.camera_index.end()) {
-    return nullptr;
-  }
-  return &rig.cameras[it->second];
-}
-
-std::string ExtractSnapshotKeyFromName(const std::string& name) {
-  if (name.empty()) {
-    return "";
-  }
-  std::string base = name;
-  const size_t sep_pos = base.find_last_of("/\\");
-  if (sep_pos != std::string::npos) {
-    base = base.substr(sep_pos + 1);
-  }
-  const size_t dot_pos = base.find_last_of('.');
-  if (dot_pos != std::string::npos) {
-    base = base.substr(0, dot_pos);
-  }
-  StringTrim(&base);
-  return base;
-}
-
-std::string ExtractSnapshotKey(const std::string& image_name,
-                               const std::string& image_prefix) {
-  std::string suffix = image_name;
-  if (!image_prefix.empty() && StringContains(image_name, image_prefix)) {
-    suffix = StringGetAfter(image_name, image_prefix);
-  }
-  while (!suffix.empty() &&
-         (suffix[0] == '/' || suffix[0] == '\\' || suffix[0] == '_' ||
-          suffix[0] == '-')) {
-    suffix.erase(suffix.begin());
-  }
-  std::string key = ExtractSnapshotKeyFromName(suffix);
-  if (key.empty()) {
-    key = ExtractSnapshotKeyFromName(image_name);
-  }
-  return key;
-}
-
 bool ParsePtreeVector(const boost::property_tree::ptree& node,
                       const size_t expected_size,
                       std::vector<double>* values) {
@@ -353,23 +297,25 @@ bool ParsePtreeVector(const boost::property_tree::ptree& node,
 }
 
 /**
- * [功能描述]：从JSON文件读取相机rig配置
+ * [功能描述]：从JSON文件读取相机rig配置（与RigBundleAdjuster格式一致）
  * @param path：JSON配置文件的路径
- * @param rig_configs：输出参数，解析后的rig配置列表
+ * @param reconstruction：用于解析快照分组与估计相对位姿
+ * @param camera_rigs：输出参数，解析后的相机rig列表
  * @param error：输出参数，解析失败时的错误信息
  * @return 解析成功返回true，失败返回false
  */
-bool ReadRigConfigFromFile(const std::string& path,
-                           std::vector<RigConfig>* rig_configs,
-                           std::string* error) {
-  // 检查输出参数是否有效
-  if (rig_configs == nullptr) {
+bool ReadCameraRigConfigFromFile(const std::string& path,
+                                 const Reconstruction& reconstruction,
+                                 std::vector<CameraRig>* camera_rigs,
+                                 std::string* error) {
+  // 检查输出参数是否为空
+  if (camera_rigs == nullptr) {
     if (error != nullptr) {
-      *error = "rig configs output is null";
+      *error = "camera rigs output is null";
     }
     return false;
   }
-  rig_configs->clear();
+  camera_rigs->clear();
 
   // 使用boost解析JSON文件
   boost::property_tree::ptree pt;
@@ -382,15 +328,14 @@ bool ReadRigConfigFromFile(const std::string& path,
     return false;
   }
 
-  // 遍历JSON中的每个rig配置节点
-  for (const auto& rig_node : pt) {
-    RigConfig rig;
-    // 读取参考相机ID（用于定义rig坐标系）
-    rig.ref_camera_id =
-        rig_node.second.get<camera_t>("ref_camera_id", kInvalidCameraId);
+  // 遍历配置文件中的每个相机rig配置
+  for (const auto& rig_config : pt) {
+    CameraRig camera_rig;
+    bool estimate_rig_relative_poses = false;  // 标记是否需要估计相对位姿
 
-    // 获取cameras子节点
-    const auto cameras_node = rig_node.second.get_child_optional("cameras");
+    // 获取cameras节点
+    std::vector<std::string> image_prefixes;
+    const auto cameras_node = rig_config.second.get_child_optional("cameras");
     if (!cameras_node) {
       if (error != nullptr) {
         *error = "rig config missing cameras";
@@ -398,64 +343,150 @@ bool ReadRigConfigFromFile(const std::string& path,
       return false;
     }
 
-    // 遍历rig中的每个相机配置
-    for (const auto& camera_node : cameras_node.get()) {
-      RigCameraConfig cam;
-      // 读取相机ID和图像前缀
-      cam.camera_id =
-          camera_node.second.get<camera_t>("camera_id", kInvalidCameraId);
-      cam.image_prefix =
-          camera_node.second.get<std::string>("image_prefix", "");
-
-      // 获取相对位姿（四元数和平移向量）节点
-      const auto rel_qvec_node =
-          camera_node.second.get_child_optional("rel_qvec");
-      const auto rel_tvec_node =
-          camera_node.second.get_child_optional("rel_tvec");
-      if (!rel_qvec_node || !rel_tvec_node) {
+    // 遍历每个相机配置
+    for (const auto& camera : cameras_node.get()) {
+      // 读取相机ID
+      const camera_t camera_id =
+          camera.second.get<camera_t>("camera_id", kInvalidCameraId);
+      if (camera_id == kInvalidCameraId) {
         if (error != nullptr) {
-          *error = "rig config missing rel_qvec or rel_tvec";
+          *error = "rig config has invalid camera_id";
+        }
+        return false;
+      }
+      // 检查相机ID是否重复
+      if (camera_rig.HasCamera(camera_id)) {
+        if (error != nullptr) {
+          *error = "rig config has duplicate camera_id";
         }
         return false;
       }
 
-      // 解析四元数(4维)和平移向量(3维)
-      std::vector<double> qvec;
-      std::vector<double> tvec;
-      if (!ParsePtreeVector(rel_qvec_node.get(), 4, &qvec) ||
-          !ParsePtreeVector(rel_tvec_node.get(), 3, &tvec)) {
+      // 读取图像前缀（用于匹配属于该相机的图像）
+      const std::string image_prefix =
+          camera.second.get<std::string>("image_prefix", "");
+      if (image_prefix.empty()) {
         if (error != nullptr) {
-          *error = "rig config invalid rel_qvec or rel_tvec size";
+          *error = "rig config missing image_prefix";
         }
         return false;
       }
+      image_prefixes.push_back(image_prefix);
 
-      // 构建四元数并归一化
-      cam.rel_qvec = Eigen::Quaterniond(qvec[0], qvec[1], qvec[2], qvec[3]);
-      if (cam.rel_qvec.norm() > 1e-12) {
-        cam.rel_qvec.normalize();
+      // 初始化相对平移向量和旋转四元数
+      Eigen::Vector3d rel_tvec = Eigen::Vector3d::Zero();
+      Eigen::Vector4d rel_qvec = ComposeIdentityQuaternion();
+
+      // 解析相对平移向量rel_tvec（如果存在）
+      const auto rel_tvec_node = camera.second.get_child_optional("rel_tvec");
+      if (rel_tvec_node) {
+        std::vector<double> tvec;
+        if (!ParsePtreeVector(rel_tvec_node.get(), 3, &tvec)) {
+          if (error != nullptr) {
+            *error = "rig config invalid rel_tvec size";
+          }
+          return false;
+        }
+        rel_tvec = Eigen::Vector3d(tvec[0], tvec[1], tvec[2]);
       } else {
-        cam.rel_qvec = Eigen::Quaterniond::Identity();  // 零四元数设为单位四元数
+        estimate_rig_relative_poses = true;  // 缺少平移向量，需要后续估计
       }
-      cam.rel_tvec = Eigen::Vector3d(tvec[0], tvec[1], tvec[2]);
 
-      // 建立相机ID到索引的映射，并添加到相机列表
-      rig.camera_index[cam.camera_id] = rig.cameras.size();
-      rig.cameras.push_back(cam);
+      // 解析相对旋转四元数rel_qvec（如果存在）
+      const auto rel_qvec_node = camera.second.get_child_optional("rel_qvec");
+      if (rel_qvec_node) {
+        std::vector<double> qvec;
+        if (!ParsePtreeVector(rel_qvec_node.get(), 4, &qvec)) {
+          if (error != nullptr) {
+            *error = "rig config invalid rel_qvec size";
+          }
+          return false;
+        }
+        // 构建四元数并归一化
+        Eigen::Quaterniond q(qvec[0], qvec[1], qvec[2], qvec[3]);
+        if (q.norm() > 1e-12) {
+          q.normalize();
+        } else {
+          q = Eigen::Quaterniond::Identity();
+        }
+        rel_qvec = Eigen::Vector4d(q.w(), q.x(), q.y(), q.z());
+      } else {
+        estimate_rig_relative_poses = true;  // 缺少旋转四元数，需要后续估计
+      }
+
+      // 将相机添加到rig中
+      camera_rig.AddCamera(camera_id, rel_qvec, rel_tvec);
     }
 
-    // 检查rig是否包含至少一个相机
-    if (rig.cameras.empty()) {
+    // 设置参考相机ID
+    const camera_t ref_camera_id =
+        rig_config.second.get<camera_t>("ref_camera_id", kInvalidCameraId);
+    if (ref_camera_id == kInvalidCameraId ||
+        !camera_rig.HasCamera(ref_camera_id)) {
       if (error != nullptr) {
-        *error = "rig config has no cameras";
+        *error = "rig config has invalid ref_camera_id";
       }
       return false;
     }
-    rig_configs->push_back(rig);
+    camera_rig.SetRefCameraId(ref_camera_id);
+
+    // 根据图像前缀将图像分组为快照(snapshots)
+    // 快照是指同一时刻由多个相机拍摄的图像集合
+    std::unordered_map<std::string, std::vector<image_t>> snapshots;
+    for (const auto image_id : reconstruction.RegImageIds()) {
+      const auto& image = reconstruction.Image(image_id);
+      for (const auto& image_prefix : image_prefixes) {
+        if (StringContains(image.Name(), image_prefix)) {
+          // 提取图像后缀作为快照的key
+          const std::string image_suffix =
+              StringGetAfter(image.Name(), image_prefix);
+          snapshots[image_suffix].push_back(image_id);
+        }
+      }
+    }
+
+    // 只添加包含参考相机的快照
+    for (const auto& snapshot : snapshots) {
+      bool has_ref_camera = false;
+      for (const auto image_id : snapshot.second) {
+        const auto& image = reconstruction.Image(image_id);
+        if (image.CameraId() == camera_rig.RefCameraId()) {
+          has_ref_camera = true;
+        }
+      }
+
+      if (has_ref_camera) {
+        camera_rig.AddSnapshot(snapshot.second);
+      }
+    }
+
+    // 验证相机rig配置的一致性
+    camera_rig.Check(reconstruction);
+
+    // 如果配置中缺少相对位姿信息，则从重建结果中估计
+    if (estimate_rig_relative_poses) {
+      if (camera_rig.NumSnapshots() == 0) {
+        if (error != nullptr) {
+          *error =
+              "no rig snapshots with reference camera to estimate poses";
+        }
+        return false;
+      }
+      PrintHeading2("Estimating relative rig poses");
+      if (!camera_rig.ComputeRelativePoses(reconstruction)) {
+        if (error != nullptr) {
+          *error =
+              "failed to estimate rig poses from reconstruction for rig config";
+        }
+        return false;
+      }
+    }
+
+    camera_rigs->push_back(camera_rig);
   }
 
-  // 检查是否解析到至少一个rig配置
-  if (rig_configs->empty()) {
+  // 确保至少解析出一个相机rig配置
+  if (camera_rigs->empty()) {
     if (error != nullptr) {
       *error = "no rig configs parsed";
     }
@@ -1229,80 +1260,71 @@ std::vector<PoseGraphEdge> BuildOdometryEdges(
  * [功能描述]：从相机rig配置构建位姿图的rig边
  *            rig边表示同一时刻多相机系统中不同相机之间的相对位姿约束
  * @param reconstruction：三维重建结果，包含已注册的图像信息
- * @param rig_configs：相机rig配置列表，定义多相机系统的结构
+ * @param camera_rigs：相机rig配置列表，定义多相机系统的结构
  * @param defaults：边的默认参数配置
  * @param occupied_pairs：已占用的图像对集合（输入/输出），用于避免重复创建边
  * @return 构建的rig边列表
  */
 std::vector<PoseGraphEdge> BuildRigEdges(
     const Reconstruction& reconstruction,
-    const std::vector<RigConfig>& rig_configs, const EdgeDefaults& defaults,
+    const std::vector<CameraRig>& camera_rigs, const EdgeDefaults& defaults,
     std::unordered_set<image_pair_t>* occupied_pairs) {
   std::vector<PoseGraphEdge> edges;
-  if (rig_configs.empty()) {
+  if (camera_rigs.empty()) {
     return edges;
   }
 
   // 遍历所有相机rig配置
-  for (const auto& rig : rig_configs) {
-    // snapshots: 快照键 -> (相机ID -> 图像ID) 的映射
-    // 用于将同一时刻拍摄的多相机图像分组
-    std::unordered_map<std::string, std::unordered_map<camera_t, image_t>> snapshots;
-    snapshots.reserve(reconstruction.RegImageIds().size());
-
-    // 第一步：收集所有图像并按快照分组
-    for (const auto image_id : reconstruction.RegImageIds()) {
-      const Image& image = reconstruction.Image(image_id);
-      // 查找该图像对应的rig相机配置
-      const auto* rig_camera = FindRigCamera(rig, image.CameraId());
-      if (rig_camera == nullptr) {
-        continue;  // 该图像不属于当前rig
-      }
-      // 从图像名称中提取快照键（同一时刻拍摄的图像共享相同的快照键）
-      const std::string snapshot_key =
-          ExtractSnapshotKey(image.Name(), rig_camera->image_prefix);
-      if (snapshot_key.empty()) {
+  for (const auto& camera_rig : camera_rigs) {
+    // 遍历rig的所有快照（同一时刻多相机拍摄的图像组）
+    for (const auto& snapshot : camera_rig.Snapshots()) {
+      if (snapshot.size() < 2) {
         continue;
       }
-      // 将图像添加到对应快照中，如果同一相机有多个图像则保留ID最小的
-      auto& snapshot = snapshots[snapshot_key];
-      auto it = snapshot.find(image.CameraId());
-      if (it == snapshot.end()) {
-        snapshot.emplace(image.CameraId(), image_id);
-      } else if (image_id < it->second) {
-        it->second = image_id;  // 保留较小的image_id
-      }
-    }
 
-    // 第二步：为每个快照中的相机对创建rig边
-    for (const auto& snapshot : snapshots) {
-      const auto& images_by_camera = snapshot.second;
+      // 建立相机ID到图像ID的映射，每个相机只保留最小的image_id
+      std::unordered_map<camera_t, image_t> images_by_camera;
+      images_by_camera.reserve(snapshot.size());
+      for (const auto image_id : snapshot) {
+        const auto& image = reconstruction.Image(image_id);
+        const camera_t camera_id = image.CameraId();
+        if (!camera_rig.HasCamera(camera_id)) {
+          continue;
+        }
+        auto it = images_by_camera.find(camera_id);
+        if (it == images_by_camera.end() || image_id < it->second) {
+          images_by_camera[camera_id] = image_id;
+        }
+      }
+
       if (images_by_camera.size() < 2) {
-        continue;  // 快照中至少需要2个相机才能构建边
+        continue;
       }
 
-      // 提取当前快照中存在的所有相机ID
+      // 收集当前快照中存在的相机ID
       std::vector<camera_t> cameras_present;
       cameras_present.reserve(images_by_camera.size());
       for (const auto& entry : images_by_camera) {
         cameras_present.push_back(entry.first);
       }
 
-      // 对所有相机对进行组合，构建rig边
+      // 对快照内的相机两两配对，构建rig约束边
       for (size_t i = 0; i + 1 < cameras_present.size(); ++i) {
         const camera_t cam_i_id = cameras_present[i];
-        const auto* cam_i = FindRigCamera(rig, cam_i_id);
-        if (cam_i == nullptr) {
-          continue;
-        }
         const image_t image_i_id = images_by_camera.at(cam_i_id);
+
+        // 获取相机i相对于rig参考坐标系的位姿
+        const Eigen::Vector4d& qvec_i = camera_rig.RelativeQvec(cam_i_id);
+        const Eigen::Vector3d& tvec_i = camera_rig.RelativeTvec(cam_i_id);
+        Eigen::Quaterniond q_i(qvec_i(0), qvec_i(1), qvec_i(2), qvec_i(3));
+        if (q_i.norm() > 1e-12) {
+          q_i.normalize();
+        } else {
+          q_i = Eigen::Quaterniond::Identity();
+        }
 
         for (size_t j = i + 1; j < cameras_present.size(); ++j) {
           const camera_t cam_j_id = cameras_present[j];
-          const auto* cam_j = FindRigCamera(rig, cam_j_id);
-          if (cam_j == nullptr) {
-            continue;
-          }
           const image_t image_j_id = images_by_camera.at(cam_j_id);
 
           // 检查该图像对是否已被占用
@@ -1313,19 +1335,24 @@ std::vector<PoseGraphEdge> BuildRigEdges(
             continue;
           }
 
-          // 计算相机i到相机j的相对位姿
-          // R_i, R_j: 各相机相对于rig坐标系的旋转矩阵
-          const Eigen::Matrix3d R_i =
-              cam_i->rel_qvec.normalized().toRotationMatrix();
-          const Eigen::Matrix3d R_j =
-              cam_j->rel_qvec.normalized().toRotationMatrix();
-          // R_ij = R_j * R_i^T：从相机i到相机j的相对旋转
-          const Eigen::Matrix3d R_ij = R_j * R_i.transpose();
-          // t_ij = t_j - R_ij * t_i：从相机i到相机j的相对平移
-          const Eigen::Vector3d t_ij =
-              cam_j->rel_tvec - R_j * R_i.transpose() * cam_i->rel_tvec;
+          // 获取相机j相对于rig参考坐标系的位姿
+          const Eigen::Vector4d& qvec_j = camera_rig.RelativeQvec(cam_j_id);
+          const Eigen::Vector3d& tvec_j = camera_rig.RelativeTvec(cam_j_id);
+          Eigen::Quaterniond q_j(qvec_j(0), qvec_j(1), qvec_j(2), qvec_j(3));
+          if (q_j.norm() > 1e-12) {
+            q_j.normalize();
+          } else {
+            q_j = Eigen::Quaterniond::Identity();
+          }
 
-          // 构建位姿图边
+          // 计算相机i到相机j的相对位姿变换
+          // R_ij = R_j * R_i^T, t_ij = t_j - R_ij * t_i
+          const Eigen::Matrix3d R_i = q_i.toRotationMatrix();
+          const Eigen::Matrix3d R_j = q_j.toRotationMatrix();
+          const Eigen::Matrix3d R_ij = R_j * R_i.transpose();
+          const Eigen::Vector3d t_ij = tvec_j - R_ij * tvec_i;
+
+          // 构建rig约束边
           PoseGraphEdge edge;
           edge.type = EdgeType::kRig;
           edge.image_id1 = image_i_id;
@@ -1942,7 +1969,8 @@ bool ParseArgs(int argc, char** argv, PipelineOptions* options) {
   return true;
 }
 
-bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database) {
+bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
+                            const std::string& rig_config_path) {
   if (reconstruction == nullptr || database == nullptr) {
     return false;
   }
@@ -2008,6 +2036,19 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database) 
     ba_config.AddImage(image_id);
   }
 
+  // 读取相机rig配置
+  std::vector<CameraRig> camera_rigs;
+  RigBundleAdjuster::Options rig_ba_options;
+  if (!rig_config_path.empty()) {
+    std::string error;
+    if (!ReadCameraRigConfigFromFile(rig_config_path, *reconstruction,
+                                     &camera_rigs, &error)) {
+      std::cout << "Failed to read rig config: " << error << "\n";
+      mapper.EndReconstruction(true);
+      return false;
+    }
+  }
+
   if (reconstruction->ComputeNumObservations() == 0) {
     std::cout << "No observations after triangulation. Skipping BA.\n";
   } else {
@@ -2020,10 +2061,10 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database) 
       const size_t num_observations = reconstruction->ComputeNumObservations();
 
       PrintHeading1("Bundle adjustment");
-      // 执行全局BA优化
-      BundleAdjuster bundle_adjuster(ba_options, ba_config);
+      // 执行全局BA优化（支持相机rig）
+      RigBundleAdjuster bundle_adjuster(ba_options, rig_ba_options, ba_config);
       // 如果BA失败，则结束重建
-      if (!bundle_adjuster.Solve(reconstruction)) {
+      if (!bundle_adjuster.Solve(reconstruction, &camera_rigs)) {
         std::cout << "ERROR: bundle adjustment failed.\n";
         mapper.EndReconstruction(true);
         return false;
@@ -2134,16 +2175,17 @@ int main(int argc, char** argv) {
       edges.insert(edges.end(), odom_edges.begin(), odom_edges.end());
     }
 
+    // 构建相机rig约束
     if (!options.rig_config_path.empty()) {
-      std::vector<RigConfig> rig_configs;
+      std::vector<CameraRig> camera_rigs;
       std::string error;
-      if (!ReadRigConfigFromFile(options.rig_config_path, &rig_configs,
-                                 &error)) {
+      if (!ReadCameraRigConfigFromFile(options.rig_config_path, reconstruction,
+                                       &camera_rigs, &error)) {
         std::cout << "Failed to read rig config: " << error << "\n";
         return -1;
       }
       auto rig_edges =
-          BuildRigEdges(reconstruction, rig_configs, options.defaults,
+          BuildRigEdges(reconstruction, camera_rigs, options.defaults,
                         &occupied_pairs);
       std::cout << "Added rig edges: " << rig_edges.size() << "\n";
       edges.insert(edges.end(), rig_edges.begin(), rig_edges.end());
@@ -2303,7 +2345,8 @@ int main(int argc, char** argv) {
   }
 
   // ========== 8. 三角化与迭代优化 ==========
-  if (!TriangulateAndOptimize(&reconstruction, &database)) {
+  if (!TriangulateAndOptimize(&reconstruction, &database,
+                              options.rig_config_path)) {
     return -1;
   }
 
