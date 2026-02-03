@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -654,12 +655,13 @@ struct PipelineOptions {
   bool build_odom_edges = true;
   bool build_loop_edges = true;
   bool run_self_test = false;
+  size_t odom_window = 5;
   double eval_threshold_px = -1.0;
-  int min_loop_id_gap = 100;
+  double min_loop_time_gap = 100.0;
   size_t min_loop_inliers = 200;
   double min_loop_inlier_ratio = 0.2;
   double max_loop_geom_error_px = 4.0;
-  double min_loop_tri_angle_deg = 1.0;
+  double min_loop_tri_angle_deg = 5.0;
   size_t max_loop_edges_per_image = 30;
   EdgeDefaults defaults;
 };
@@ -668,6 +670,58 @@ bool IsNumericToken(const std::string& token) {
   char* end_ptr = nullptr;
   std::strtod(token.c_str(), &end_ptr);
   return end_ptr != token.c_str() && *end_ptr == '\0';
+}
+
+std::string GetBaseName(const std::string& name) {
+  const auto pos = name.find_last_of("/\\");
+  if (pos == std::string::npos) {
+    return name;
+  }
+  return name.substr(pos + 1);
+}
+
+std::string StripExtension(const std::string& name) {
+  const auto pos = name.find_last_of('.');
+  if (pos == std::string::npos || pos == 0) {
+    return name;
+  }
+  return name.substr(0, pos);
+}
+
+bool TryParseImageTimestamp(const std::string& name, double* timestamp) {
+  if (timestamp == nullptr) {
+    return false;
+  }
+  const std::string base = StripExtension(GetBaseName(name));
+  size_t end = base.size();
+  size_t start = end;
+  bool has_digit = false;
+  bool has_dot = false;
+  while (start > 0) {
+    const unsigned char ch = static_cast<unsigned char>(base[start - 1]);
+    if (std::isdigit(ch)) {
+      has_digit = true;
+      --start;
+      continue;
+    }
+    if (ch == '.' && !has_dot) {
+      has_dot = true;
+      --start;
+      continue;
+    }
+    break;
+  }
+  if (!has_digit || start == end) {
+    return false;
+  }
+  const std::string token = base.substr(start, end - start);
+  char* end_ptr = nullptr;
+  const double parsed = std::strtod(token.c_str(), &end_ptr);
+  if (end_ptr == token.c_str() || *end_ptr != '\0' || !std::isfinite(parsed)) {
+    return false;
+  }
+  *timestamp = parsed;
+  return true;
 }
 
 std::string EdgeTypeToString(const EdgeType type) {
@@ -1529,62 +1583,97 @@ bool EstimateLoopScaleFromPointPairsSim3(
 }
 
 /**
- * [功能描述]：从重建结果构建里程计边（相邻帧之间的相对位姿）
+ * [功能描述]：从重建结果构建里程计边（按快照排序，连接后续N帧）
  * @param reconstruction：3D重建结果
  * @param defaults：边的默认参数配置
+ * @param odom_window：每帧连接的后续帧数（至少为1）
  * @return 里程计边列表
  */
 std::vector<PoseGraphEdge> BuildOdometryEdges(
-    const Reconstruction& reconstruction, const EdgeDefaults& defaults) {
-  // 按相机ID分组图像
-  std::unordered_map<camera_t, std::vector<image_t>> camera_image_ids;
-  camera_image_ids.reserve(reconstruction.Cameras().size());
+    const Reconstruction& reconstruction, const EdgeDefaults& defaults,
+    const size_t odom_window) {
+  struct SnapshotEntry {
+    image_t image_id = kInvalidImageId;
+    std::string name;
+    bool has_number = false;
+    double number = 0.0;
+  };
 
+  const size_t window = std::max<size_t>(1, odom_window);
+
+  // 按相机ID分组图像
+  std::unordered_map<camera_t, std::vector<SnapshotEntry>> camera_entries;
+  camera_entries.reserve(reconstruction.Cameras().size());
+
+  // 遍历重建中的所有图像，构建每个相机的图像列表
   for (const auto image_id : reconstruction.RegImageIds()) {
     const Image& image = reconstruction.Image(image_id);
-    camera_image_ids[image.CameraId()].push_back(image_id);
+    SnapshotEntry entry;
+    entry.image_id = image_id;
+    entry.name = image.Name();
+    double value = 0.0;
+    entry.has_number = TryParseImageTimestamp(entry.name, &value);
+    entry.number = value;
+    camera_entries[image.CameraId()].push_back(std::move(entry));
   }
 
   std::vector<PoseGraphEdge> edges;
   // 遍历每个相机的图像序列
-  for (auto& pair : camera_image_ids) {
-    auto& ids = pair.second;
-    std::sort(ids.begin(), ids.end());  // 按ID排序保证时序
-    if (ids.size() < 2) {
+  for (auto& pair : camera_entries) {
+    auto& entries = pair.second;
+    std::sort(entries.begin(), entries.end(),
+              [](const SnapshotEntry& a, const SnapshotEntry& b) {
+                if (a.has_number && b.has_number) {
+                  if (a.number != b.number) {
+                    return a.number < b.number;
+                  }
+                } else if (a.name != b.name) {
+                  return a.name < b.name;
+                }
+                if (a.name != b.name) {
+                  return a.name < b.name;
+                }
+                return a.image_id < b.image_id;
+              });  // 按快照排序
+    if (entries.size() < 2) {
       continue;  // 至少需要2帧才能构建边
     }
 
-    // 构建相邻帧之间的里程计边
-    for (size_t idx = 0; idx + 1 < ids.size(); ++idx) {
-      const image_t image_id_i = ids[idx];
-      const image_t image_id_j = ids[idx + 1];
+    // 构建每帧与后续window帧之间的里程计边
+    for (size_t idx = 0; idx + 1 < entries.size(); ++idx) {
+      const image_t image_id_i = entries[idx].image_id;
       const Image& image_i = reconstruction.Image(image_id_i);
-      const Image& image_j = reconstruction.Image(image_id_j);
 
-      // 计算相对位姿（从i到j的变换）
-      Eigen::Vector4d qvec_ij;
-      Eigen::Vector3d tvec_ij;
-      ComputeRelativePose(image_i.Qvec(), image_i.Tvec(), image_j.Qvec(),
-                          image_j.Tvec(), &qvec_ij, &tvec_ij);
-      
-      Eigen::Vector3d tvec_ij_dir = tvec_ij.normalized();
+      for (size_t step = 1; step <= window && idx + step < entries.size();
+           ++step) {
+        const image_t image_id_j = entries[idx + step].image_id;
+        const Image& image_j = reconstruction.Image(image_id_j);
 
-      // 构建里程计边
-      PoseGraphEdge edge;
-      edge.type = EdgeType::kOdom;
-      edge.image_id1 = image_id_i;
-      edge.image_id2 = image_id_j;
-      edge.q_ij = Eigen::Quaterniond(qvec_ij(0), qvec_ij(1), qvec_ij(2),
-                                     qvec_ij(3));
-      if (defaults.odom_translation_is_unit) {
-        edge.t_ij = tvec_ij_dir;
-      } else {
-        edge.t_ij = tvec_ij;
+        // 计算相对位姿（从i到j的变换）
+        Eigen::Vector4d qvec_ij;
+        Eigen::Vector3d tvec_ij;
+        ComputeRelativePose(image_i.Qvec(), image_i.Tvec(), image_j.Qvec(),
+                            image_j.Tvec(), &qvec_ij, &tvec_ij);
+
+        Eigen::Vector3d tvec_ij_dir = tvec_ij.normalized();
+
+        // 构建里程计边
+        PoseGraphEdge edge;
+        edge.type = EdgeType::kOdom;
+        edge.image_id1 = image_id_i;
+        edge.image_id2 = image_id_j;
+        edge.q_ij = Eigen::Quaterniond(qvec_ij(0), qvec_ij(1), qvec_ij(2),
+                                       qvec_ij(3));
+        if (defaults.odom_translation_is_unit) {
+          edge.t_ij = tvec_ij_dir;
+        } else {
+          edge.t_ij = tvec_ij;
+        }
+        edge.translation_is_unit = defaults.odom_translation_is_unit;
+        edge.rot_weight = defaults.odom_rot_weight;
+        edge.trans_weight = defaults.odom_trans_weight;
+        edges.push_back(edge);
       }
-      edge.translation_is_unit = defaults.odom_translation_is_unit;
-      edge.rot_weight = defaults.odom_rot_weight;
-      edge.trans_weight = defaults.odom_trans_weight;
-      edges.push_back(edge);
     }
   }
 
@@ -1817,6 +1906,32 @@ std::vector<PoseGraphEdge> BuildLoopEdges(
   std::unordered_map<image_t, size_t> loop_degree;
   loop_degree.reserve(reconstruction.RegImageIds().size());
 
+  std::unordered_map<image_t, double> image_timestamps;
+  image_timestamps.reserve(reconstruction.RegImageIds().size());
+  // 获取图像时间戳
+  auto GetTimestamp = [&](const image_t image_id, double* timestamp) {
+    if (timestamp == nullptr) {
+      return false;
+    }
+    auto it = image_timestamps.find(image_id);
+    if (it != image_timestamps.end()) {
+      if (std::isfinite(it->second)) {
+        *timestamp = it->second;
+        return true;
+      }
+      return false;
+    }
+    const Image& image = reconstruction.Image(image_id);
+    double value = 0.0;
+    if (TryParseImageTimestamp(image.Name(), &value)) {
+      image_timestamps.emplace(image_id, value);
+      *timestamp = value;
+      return true;
+    }
+    image_timestamps.emplace(image_id, std::numeric_limits<double>::quiet_NaN());
+    return false;
+  };
+
   const double min_tri_angle = DegToRad(options.min_loop_tri_angle_deg);
   std::vector<PoseGraphEdge> edges;
 
@@ -1837,9 +1952,13 @@ std::vector<PoseGraphEdge> BuildLoopEdges(
       continue;
     }
 
-    // 过滤3：图像ID间隔足够大（避免相邻帧）
-    if (std::abs(static_cast<int>(i) - static_cast<int>(j)) <
-        options.min_loop_id_gap) {
+    // 过滤3：图像时间间隔足够大（避免相邻帧）
+    double time_i = 0.0;
+    double time_j = 0.0;
+    if (!GetTimestamp(i, &time_i) || !GetTimestamp(j, &time_j)) {
+      continue;
+    }
+    if (std::abs(time_i - time_j) < options.min_loop_time_gap) {
       continue;
     }
 
@@ -1954,6 +2073,32 @@ std::vector<PoseGraphEdge> BuildLoopEdgesSim3(
   std::unordered_map<image_t, size_t> loop_degree;
   loop_degree.reserve(reconstruction.RegImageIds().size());
 
+  std::unordered_map<image_t, double> image_timestamps;
+  image_timestamps.reserve(reconstruction.RegImageIds().size());
+  // 获取图像时间戳
+  auto GetTimestamp = [&](const image_t image_id, double* timestamp) {
+    if (timestamp == nullptr) {
+      return false;
+    }
+    auto it = image_timestamps.find(image_id);
+    if (it != image_timestamps.end()) {
+      if (std::isfinite(it->second)) {
+        *timestamp = it->second;
+        return true;
+      }
+      return false;
+    }
+    const Image& image = reconstruction.Image(image_id);
+    double value = 0.0;
+    if (TryParseImageTimestamp(image.Name(), &value)) {
+      image_timestamps.emplace(image_id, value);
+      *timestamp = value;
+      return true;
+    }
+    image_timestamps.emplace(image_id, std::numeric_limits<double>::quiet_NaN());
+    return false;
+  };
+
   const double min_tri_angle = DegToRad(options.min_loop_tri_angle_deg);
   std::vector<PoseGraphEdge> edges;
 
@@ -1974,9 +2119,13 @@ std::vector<PoseGraphEdge> BuildLoopEdgesSim3(
       continue;
     }
 
-    // 过滤3：图像ID间隔足够大（避免相邻帧）
-    if (std::abs(static_cast<int>(i) - static_cast<int>(j)) <
-        options.min_loop_id_gap) {
+    // 过滤3：图像时间间隔足够大（避免相邻帧）
+    double time_i = 0.0;
+    double time_j = 0.0;
+    if (!GetTimestamp(i, &time_i) || !GetTimestamp(j, &time_j)) {
+      continue;
+    }
+    if (std::abs(time_i - time_j) < options.min_loop_time_gap) {
       continue;
     }
 
@@ -2020,11 +2169,6 @@ std::vector<PoseGraphEdge> BuildLoopEdgesSim3(
     // 过滤9：每个图像的回环边数量不超过上限
     if (loop_degree[i] >= options.max_loop_edges_per_image ||
         loop_degree[j] >= options.max_loop_edges_per_image) {
-      continue;
-    }
-
-    // 图像对的相机id必须相同
-    if (image_i.CameraId() != image_j.CameraId()) {
       continue;
     }
 
@@ -2290,6 +2434,7 @@ void PrintUsage() {
          "  --edge-output <path>  Write pose-graph edges.\n"
          "  --manual-loop <path>  Add manual loop edges file.\n"
          "  --rig-config <path>   Add fixed rig constraints.\n"
+         "  --odom-window <n>     Connect each frame to next n frames.\n"
          "  --skip-odom           Disable odometry edges.\n"
          "  --skip-loop           Disable auto loop edges.\n"
          "  --eval-threshold <px> Fail if mean reprojection error exceeds.\n"
@@ -2339,6 +2484,11 @@ bool ParseArgs(int argc, char** argv, PipelineOptions* options) {
     // 可选参数：相机rig配置文件
     if (arg == "--rig-config" && i + 1 < argc) {
       options->rig_config_path = argv[++i];
+      continue;
+    }
+    // 可选参数：里程计窗口大小
+    if (arg == "--odom-window" && i + 1 < argc) {
+      options->odom_window = std::stoul(argv[++i]);
       continue;
     }
     // 可选参数：评估阈值（像素）
@@ -2733,7 +2883,9 @@ int main(int argc, char** argv) {
   } else {
     // 自动构建里程计边
     if (options.build_odom_edges) {
-      auto odom_edges = BuildOdometryEdges(reconstruction, options.defaults);
+      auto odom_edges =
+          BuildOdometryEdges(reconstruction, options.defaults,
+                             options.odom_window);
       // auto odom_edges = BuildOdometryEdges(reconstruction, &database, options.defaults);
       for (const auto& edge : odom_edges) {
         const image_pair_t pair_id =
@@ -2919,11 +3071,11 @@ int main(int argc, char** argv) {
     image.SetTvec(t);
   }
 
-  // ========== 9. 三角化与迭代优化 ==========
-  if (!TriangulateAndOptimize(&reconstruction, &database,
-                              options.rig_config_path)) {
-    return -1;
-  }
+  // // ========== 9. 三角化与迭代优化 ==========
+  // if (!TriangulateAndOptimize(&reconstruction, &database,
+  //                             options.rig_config_path)) {
+  //   return -1;
+  // }
 
   // ========== 10. 评估并保存结果 ==========
   const double post_error = reconstruction.ComputeMeanReprojectionError();
