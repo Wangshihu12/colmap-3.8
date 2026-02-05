@@ -31,6 +31,7 @@
 #include "estimators/two_view_geometry.h"
 #include "estimators/utils.h"
 #include "feature/utils.h"
+#include "optim/loransac.h"
 #include "optim/ransac.h"
 #include "util/math.h"
 #include "util/misc.h"
@@ -1410,7 +1411,7 @@ bool EstimateRelativePoseFromInliers(
 
 /**
  * [功能描述]：使用2D-2D内点匹配对应的不同3D点估计回环平移尺度
- *            将匹配提升为3D-3D对应，通过Sim3(Umeyama+RANSAC)估计
+ *            将匹配提升为3D-3D对应，通过Sim3(Umeyama+LORANSAC)估计
  *            i->j 的相似变换，取平移向量模长作为尺度
  * @param reconstruction：3D重建结果
  * @param geom：两视图几何信息（包含内点匹配）
@@ -1433,18 +1434,80 @@ bool EstimateLoopScaleFromPointPairsSim3(
   const double kMinDepth = 1e-6;  // 最小深度阈值
   const double kMinAbsTransCos = 0.2;  // 最小绝对平移余弦值
   const double kMaxRotDiffRad = DegToRad(30.0);  // 最大旋转差异阈值
+  const double kMaxReprojErrorPx = 8.0;  // 最大重投影误差（像素）
+  const size_t kMinTrackLength = 3;  // 最小track长度（观测数量）
+  const double kMaxDepthRatio = 10.0;  // 最大深度比率（相对于中值深度）
 
-  // 提取匹配点对应的3D点
-  std::vector<Eigen::Vector3d> points_i;
-  std::vector<Eigen::Vector3d> points_j;
-  points_i.reserve(geom.inlier_matches.size());
-  points_j.reserve(geom.inlier_matches.size());
+  // 获取两幅图像对应的相机参数（用于计算重投影误差）
+  const Camera& camera_i = reconstruction.Camera(image_i.CameraId());
+  const Camera& camera_j = reconstruction.Camera(image_j.CameraId());
+
+  // 获取两幅图像的位姿参数
+  const Eigen::Vector4d qvec_i = image_i.Qvec();
+  const Eigen::Vector4d qvec_j = image_j.Qvec();
+  const Eigen::Vector3d tvec_i = image_i.Tvec();
+  const Eigen::Vector3d tvec_j = image_j.Tvec();
 
   // 获取两幅图像的旋转和平移矩阵
   const Eigen::Matrix3d R_i = image_i.RotationMatrix();
   const Eigen::Vector3d t_i = image_i.Tvec();
   const Eigen::Matrix3d R_j = image_j.RotationMatrix();
   const Eigen::Vector3d t_j = image_j.Tvec();
+
+  // 第一次遍历：收集所有候选点并计算深度，用于计算中值深度
+  std::vector<double> all_depths;
+  all_depths.reserve(geom.inlier_matches.size() * 2);
+
+  for (const auto& match : geom.inlier_matches) {
+    if (match.point2D_idx1 >= image_i.NumPoints2D() ||
+        match.point2D_idx2 >= image_j.NumPoints2D()) {
+      continue;
+    }
+
+    const Point2D& point2D_i = image_i.Point2D(match.point2D_idx1);
+    const Point2D& point2D_j = image_j.Point2D(match.point2D_idx2);
+    if (!point2D_i.HasPoint3D() || !point2D_j.HasPoint3D()) {
+      continue;
+    }
+
+    const point3D_t point3D_id_i = point2D_i.Point3DId();
+    const point3D_t point3D_id_j = point2D_j.Point3DId();
+    if (!reconstruction.ExistsPoint3D(point3D_id_i) ||
+        !reconstruction.ExistsPoint3D(point3D_id_j)) {
+      continue;
+    }
+
+    const Point3D& point3D_i = reconstruction.Point3D(point3D_id_i);
+    const Point3D& point3D_j = reconstruction.Point3D(point3D_id_j);
+
+    // 计算3D点在相机坐标系下的坐标，获取深度
+    const Eigen::Vector3d xyz_i = R_i * point3D_i.XYZ() + t_i;
+    const Eigen::Vector3d xyz_j = R_j * point3D_j.XYZ() + t_j;
+
+    if (xyz_i.allFinite() && xyz_i.z() > kMinDepth) {
+      all_depths.push_back(xyz_i.z());
+    }
+    if (xyz_j.allFinite() && xyz_j.z() > kMinDepth) {
+      all_depths.push_back(xyz_j.z());
+    }
+  }
+
+  // 计算中值深度，用于后续的极远点过滤
+  if (all_depths.size() < kMinPointPairs * 2) {
+    return false;
+  }
+  const double median_depth = Median(all_depths);
+  if (!std::isfinite(median_depth) || median_depth <= kMinDepth) {
+    return false;
+  }
+  // 极远点深度阈值
+  const double max_depth = median_depth * kMaxDepthRatio;
+
+  // 提取匹配点对应的3D点（第二次遍历，应用所有过滤条件）
+  std::vector<Eigen::Vector3d> points_i;
+  std::vector<Eigen::Vector3d> points_j;
+  points_i.reserve(geom.inlier_matches.size());
+  points_j.reserve(geom.inlier_matches.size());
 
   // 遍历匹配点，计算对应3D点在两视图相机坐标系下的坐标
   for (const auto& match : geom.inlier_matches) {
@@ -1460,7 +1523,7 @@ bool EstimateLoopScaleFromPointPairsSim3(
       continue;
     }
 
-    // 获取匹配点对应的3D点
+    // 获取匹配点对应的3D点ID
     const point3D_t point3D_id_i = point2D_i.Point3DId();
     const point3D_t point3D_id_j = point2D_j.Point3DId();
     if (!reconstruction.ExistsPoint3D(point3D_id_i) ||
@@ -1468,15 +1531,51 @@ bool EstimateLoopScaleFromPointPairsSim3(
       continue;
     }
 
-    // 计算3D点在两视图相机坐标系下的坐标
+    // 获取3D点
     const Point3D& point3D_i = reconstruction.Point3D(point3D_id_i);
     const Point3D& point3D_j = reconstruction.Point3D(point3D_id_j);
+
+    // 过滤1：检查3D点的观测数量（track length）
+    if (point3D_i.Track().Length() < kMinTrackLength ||
+        point3D_j.Track().Length() < kMinTrackLength) {
+      continue;
+    }
+
+    // 过滤2：计算并检查重投影误差
+    // 将3D点投影到对应图像上，计算与观测2D点的误差
+    const Eigen::Vector3d proj_i = QuaternionRotatePoint(qvec_i, point3D_i.XYZ()) + tvec_i;
+    const Eigen::Vector3d proj_j = QuaternionRotatePoint(qvec_j, point3D_j.XYZ()) + tvec_j;
+
+    // 确保点在相机前方
+    if (proj_i.z() < std::numeric_limits<double>::epsilon() ||
+        proj_j.z() < std::numeric_limits<double>::epsilon()) {
+      continue;
+    }
+
+    // 投影到图像平面并计算重投影误差
+    const Eigen::Vector2d proj_point2D_i = camera_i.WorldToImage(proj_i.hnormalized());
+    const Eigen::Vector2d proj_point2D_j = camera_j.WorldToImage(proj_j.hnormalized());
+    const double reproj_error_i = (proj_point2D_i - point2D_i.XY()).norm();
+    const double reproj_error_j = (proj_point2D_j - point2D_j.XY()).norm();
+
+    if (reproj_error_i > kMaxReprojErrorPx || reproj_error_j > kMaxReprojErrorPx) {
+      continue;
+    }
+
+    // 计算3D点在两视图相机坐标系下的坐标
     const Eigen::Vector3d xyz_i = R_i * point3D_i.XYZ() + t_i;
     const Eigen::Vector3d xyz_j = R_j * point3D_j.XYZ() + t_j;
     if (!xyz_i.allFinite() || !xyz_j.allFinite()) {
       continue;
     }
+
+    // 过滤3：检查深度是否有效（最小深度）
     if (xyz_i.z() <= kMinDepth || xyz_j.z() <= kMinDepth) {
+      continue;
+    }
+
+    // 过滤4：过滤极远点（深度大于中值深度的kMaxDepthRatio倍）
+    if (xyz_i.z() > max_depth || xyz_j.z() > max_depth) {
       continue;
     }
 
@@ -1489,7 +1588,7 @@ bool EstimateLoopScaleFromPointPairsSim3(
     return false;
   }
 
-  // 计算匹配点对应的3D点在两视图相机坐标系下的尺度
+  // 计算匹配点对应的3D点在两视图相机坐标系下的尺度（用于设置RANSAC误差阈值）
   std::vector<double> norms;
   norms.reserve(points_i.size() + points_j.size());
   for (const auto& p : points_i) {
@@ -1503,19 +1602,19 @@ bool EstimateLoopScaleFromPointPairsSim3(
     return false;
   }
 
-  // 设置RANSAC参数
+  // 设置LORANSAC参数
   RANSACOptions ransac_options;
   ransac_options.max_error =
       std::max(1e-12, std::pow(0.05 * median_norm, 2));
-  ransac_options.min_inlier_ratio = 0.2;
+  ransac_options.min_inlier_ratio = 0.25;  // 提高内点比例要求
   ransac_options.confidence = 0.999;
-  ransac_options.min_num_trials = 50;
-  ransac_options.max_num_trials = 2000;
+  ransac_options.min_num_trials = 100;
+  ransac_options.max_num_trials = 5000;  // 增加最大迭代次数
 
-  // 使用相似变换估计器
+  // 使用LORANSAC进行鲁棒估计（局部优化RANSAC）
   using Sim3Estimator = SimilarityTransformEstimator<3, true>;
-  RANSAC<Sim3Estimator> ransac(ransac_options);
-  const auto report = ransac.Estimate(points_i, points_j);
+  LORANSAC<Sim3Estimator, Sim3Estimator> loransac(ransac_options);
+  const auto report = loransac.Estimate(points_i, points_j);
   if (!report.success) {
     return false;
   }
@@ -1540,6 +1639,7 @@ bool EstimateLoopScaleFromPointPairsSim3(
     return false;
   }
 
+  // 使用所有内点重新估计Sim3变换
   const auto models = Sim3Estimator::Estimate(inlier_i, inlier_j);
   if (models.empty()) {
     return false;
@@ -2554,6 +2654,15 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
     return false;
   }
 
+  // 清除当前重建中的所有3D点及其观测关联，避免影响后续三角化
+  if (reconstruction->NumPoints3D() > 0) {
+    const auto point3D_ids = reconstruction->Point3DIds();
+    for (const auto point3D_id : point3D_ids) {
+      reconstruction->DeletePoint3D(point3D_id);
+    }
+    std::cout << "Cleared existing 3D points: " << point3D_ids.size() << "\n";
+  }
+
   if (reconstruction->NumRegImages() < 2) {
     std::cout << "Need at least two registered images for triangulation.\n";
     return false;
@@ -2564,6 +2673,11 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
   mapper_options.ba_refine_focal_length = false;
   mapper_options.ba_refine_principal_point = false;
   mapper_options.ba_refine_extra_params = false;
+  mapper_options.ba_global_max_refinements = 5; // 调整全局优化迭代次数
+  mapper_options.ba_global_max_num_iterations = 50;
+  const double kStrictMaxReprojError = 3.0; // 严格的重投影误差阈值
+  const double kStrictMinTriAngle = 2.5;    // 严格的最小三角化角度阈值（度）
+  const size_t kMinTrackLength = 3;         // 最短轨迹长度阈值
 
   DatabaseCache database_cache;
   const size_t min_num_matches =
@@ -2584,17 +2698,17 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
     const image_t image_id = reg_image_ids[i];
     const auto& image = reconstruction->Image(image_id);
 
-    PrintHeading1(
-        StringPrintf("Triangulating image #%d (%d)", image_id, i));
+    // PrintHeading1(
+    //     StringPrintf("Triangulating image #%d (%d)", image_id, i));
 
-    const size_t num_existing_points3D = image.NumPoints3D();
-    std::cout << "  => Image sees " << num_existing_points3D << " / "
-              << image.NumObservations() << " points\n";
+    // const size_t num_existing_points3D = image.NumPoints3D();
+    // std::cout << "  => Image sees " << num_existing_points3D << " / "
+    //           << image.NumObservations() << " points\n";
 
     mapper.TriangulateImage(tri_options, image_id);
 
-    std::cout << "  => Triangulated "
-              << (image.NumPoints3D() - num_existing_points3D) << " points\n";
+    // std::cout << "  => Triangulated "
+    //           << (image.NumPoints3D() - num_existing_points3D) << " points\n";
   }
 
   PrintHeading1("Retriangulation");
@@ -2602,6 +2716,29 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
   CompleteAndMergeTracks(mapper_options, &mapper);
   std::cout << "  => Retriangulated observations: "
             << mapper.Retriangulate(tri_options) << "\n";
+  // 过滤掉深度为负的观测点
+  reconstruction->FilterObservationsWithNegativeDepth();
+  // 过滤掉重投影误差过大的观测点
+  const size_t filtered_obs = reconstruction->FilterAllPoints3D(kStrictMaxReprojError, kStrictMinTriAngle);
+  if (filtered_obs > 0) {
+    std::cout << "  => Filtered observations (strict): " << filtered_obs
+              << "\n";
+  }
+  // 过滤掉观测数量小于kMinTrackLength的3D点
+  const auto point3D_ids = reconstruction->Point3DIds();
+  size_t removed_tracks = 0;
+  for (const auto point3D_id : point3D_ids) {
+    if (!reconstruction->ExistsPoint3D(point3D_id)) {
+      continue;
+    }
+    if (reconstruction->Point3D(point3D_id).Track().Length() < kMinTrackLength) {
+      reconstruction->DeletePoint3D(point3D_id);
+      removed_tracks += 1;
+    }
+  }
+  if (removed_tracks > 0) {
+    std::cout << "  => Removed short tracks: " << removed_tracks << "\n";
+  }
 
   auto ba_options = mapper_options.GlobalBundleAdjustment();
   ba_options.refine_focal_length = false;
@@ -2655,6 +2792,29 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
           CompleteAndMergeTracks(mapper_options, &mapper);
       // num_changed_observations += mapper.Retriangulate(tri_options);
       num_changed_observations += FilterPoints(mapper_options, &mapper);
+      // 过滤掉重投影误差过大的观测点
+      const size_t iter_filtered = reconstruction->FilterAllPoints3D(kStrictMaxReprojError, kStrictMinTriAngle);
+      if (iter_filtered > 0) {
+        std::cout << "  => Filtered observations (strict): " << iter_filtered
+                  << "\n";
+      }
+      // 过滤掉观测数量小于kMinTrackLength的3D点
+      const auto iter_point3D_ids = reconstruction->Point3DIds();
+      size_t iter_removed_tracks = 0;
+      for (const auto point3D_id : iter_point3D_ids) {
+        if (!reconstruction->ExistsPoint3D(point3D_id)) {
+          continue;
+        }
+        if (reconstruction->Point3D(point3D_id).Track().Length() <
+            kMinTrackLength) {
+          reconstruction->DeletePoint3D(point3D_id);
+          iter_removed_tracks += 1;
+        }
+      }
+      if (iter_removed_tracks > 0) {
+        std::cout << "  => Removed short tracks: " << iter_removed_tracks
+                  << "\n";
+      }
       const double changed =
           num_observations == 0
               ? 0
@@ -2667,6 +2827,9 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
       }
     }
   }
+
+  // 过滤图像
+  FilterImages(mapper_options, &mapper);
 
   const bool kDiscardReconstruction = false;
   mapper.EndReconstruction(kDiscardReconstruction);
