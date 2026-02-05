@@ -653,6 +653,7 @@ struct PipelineOptions {
   std::string edge_output_path;
   std::string manual_loop_path;
   std::string rig_config_path;
+  std::string gt_reconstruction_path;  // 真值重建路径（可选，用于评估回环误差）
   bool build_odom_edges = true;
   bool build_loop_edges = true;
   bool run_self_test = false;
@@ -1683,6 +1684,310 @@ bool EstimateLoopScaleFromPointPairsSim3(
 }
 
 /**
+ * [功能描述]：回环相对位姿误差记录结构体
+ */
+struct LoopPoseError {
+  image_t image_id1;               // 图像1的ID
+  image_t image_id2;               // 图像2的ID
+  std::string image_name1;         // 图像1的名称
+  std::string image_name2;         // 图像2的名称
+  double rot_error_deg;            // 旋转误差（度）
+  double trans_error;              // 平移误差（米）
+  double trans_error_normalized;   // 归一化平移误差（方向误差角度，度）
+  Eigen::Quaterniond q_est;        // 估计的相对旋转
+  Eigen::Vector3d t_est;           // 估计的相对平移
+  Eigen::Quaterniond q_gt;         // 真值相对旋转
+  Eigen::Vector3d t_gt;            // 真值相对平移
+};
+
+/**
+ * [功能描述]：从真值重建中计算两幅图像的相对位姿
+ * @param gt_reconstruction：真值重建
+ * @param image_name_i：图像i的名称
+ * @param image_name_j：图像j的名称
+ * @param q_ij_out：输出参数，从i到j的相对旋转（四元数）
+ * @param t_ij_out：输出参数，从i到j的相对平移
+ * @return 成功返回true，失败返回false
+ */
+bool ComputeRelativePoseFromGT(
+    const Reconstruction& gt_reconstruction,
+    const std::string& image_name_i,
+    const std::string& image_name_j,
+    Eigen::Quaterniond* q_ij_out,
+    Eigen::Vector3d* t_ij_out) {
+  if (q_ij_out == nullptr || t_ij_out == nullptr) {
+    return false;
+  }
+
+  // 在真值重建中查找对应的图像
+  const Image* gt_image_i = nullptr;
+  const Image* gt_image_j = nullptr;
+  for (const auto& pair : gt_reconstruction.Images()) {
+    const std::string& name = pair.second.Name();
+    if (name == image_name_i) {
+      gt_image_i = &pair.second;
+    }
+    if (name == image_name_j) {
+      gt_image_j = &pair.second;
+    }
+    if (gt_image_i != nullptr && gt_image_j != nullptr) {
+      break;
+    }
+  }
+
+  if (gt_image_i == nullptr || gt_image_j == nullptr) {
+    return false;
+  }
+
+  // 检查图像是否已注册
+  if (!gt_image_i->IsRegistered() || !gt_image_j->IsRegistered()) {
+    return false;
+  }
+
+  // 计算相对位姿
+  Eigen::Vector4d qvec_ij;
+  Eigen::Vector3d tvec_ij;
+  ComputeRelativePose(gt_image_i->Qvec(), gt_image_i->Tvec(),
+                      gt_image_j->Qvec(), gt_image_j->Tvec(),
+                      &qvec_ij, &tvec_ij);
+
+  *q_ij_out = Eigen::Quaterniond(qvec_ij(0), qvec_ij(1), qvec_ij(2), qvec_ij(3));
+  *t_ij_out = tvec_ij;
+  return true;
+}
+
+/**
+ * [功能描述]：计算两个旋转之间的角度误差
+ * @param q1：旋转1（四元数）
+ * @param q2：旋转2（四元数）
+ * @return 角度误差（度）
+ */
+double ComputeRotationError(const Eigen::Quaterniond& q1,
+                            const Eigen::Quaterniond& q2) {
+  // 计算相对旋转
+  const Eigen::Quaterniond dq = q1.conjugate() * q2;
+  // 计算旋转角度
+  const double angle_rad = 2.0 * std::acos(std::min(1.0, std::abs(dq.w())));
+  return RadToDeg(angle_rad);
+}
+
+/**
+ * [功能描述]：计算两个平移向量之间的方向误差（角度）
+ * @param t1：平移向量1
+ * @param t2：平移向量2
+ * @return 方向误差（度）
+ */
+double ComputeTranslationDirectionError(const Eigen::Vector3d& t1,
+                                        const Eigen::Vector3d& t2) {
+  const double norm1 = t1.norm();
+  const double norm2 = t2.norm();
+  if (norm1 < 1e-12 || norm2 < 1e-12) {
+    return 180.0;  // 平移向量太小，返回最大误差
+  }
+  const double cos_angle = t1.dot(t2) / (norm1 * norm2);
+  const double angle_rad = std::acos(std::max(-1.0, std::min(1.0, cos_angle)));
+  return RadToDeg(angle_rad);
+}
+
+/**
+ * [功能描述]：计算回环相对位姿与真值之间的误差
+ * @param gt_reconstruction：真值重建
+ * @param image_i：当前重建中的图像i
+ * @param image_j：当前重建中的图像j
+ * @param q_ij_est：估计的相对旋转
+ * @param t_ij_est：估计的相对平移
+ * @param error_out：输出参数，误差记录
+ * @return 成功返回true，失败返回false
+ */
+bool ComputeLoopPoseError(
+    const Reconstruction& gt_reconstruction,
+    const Image& image_i,
+    const Image& image_j,
+    const Eigen::Quaterniond& q_ij_est,
+    const Eigen::Vector3d& t_ij_est,
+    LoopPoseError* error_out) {
+  if (error_out == nullptr) {
+    return false;
+  }
+
+  // 从真值重建中计算相对位姿
+  Eigen::Quaterniond q_ij_gt;
+  Eigen::Vector3d t_ij_gt;
+  if (!ComputeRelativePoseFromGT(gt_reconstruction, image_i.Name(),
+                                  image_j.Name(), &q_ij_gt, &t_ij_gt)) {
+    return false;
+  }
+
+  // 填充误差记录
+  error_out->image_id1 = image_i.ImageId();
+  error_out->image_id2 = image_j.ImageId();
+  error_out->image_name1 = image_i.Name();
+  error_out->image_name2 = image_j.Name();
+  error_out->q_est = q_ij_est;
+  error_out->t_est = t_ij_est;
+  error_out->q_gt = q_ij_gt;
+  error_out->t_gt = t_ij_gt;
+
+  // 计算旋转误差
+  error_out->rot_error_deg = ComputeRotationError(q_ij_est, q_ij_gt);
+
+  // 计算平移误差（欧氏距离）
+  error_out->trans_error = (t_ij_est - t_ij_gt).norm();
+
+  // 计算平移方向误差
+  error_out->trans_error_normalized =
+      ComputeTranslationDirectionError(t_ij_est, t_ij_gt);
+
+  return true;
+}
+
+/**
+ * [功能描述]：将回环相对位姿误差写入文件
+ * @param path：输出文件路径
+ * @param errors：误差记录列表
+ * @param error：输出参数，错误信息
+ * @return 成功返回true，失败返回false
+ */
+bool WriteLoopPoseErrorsToFile(const std::string& path,
+                               const std::vector<LoopPoseError>& errors,
+                               std::string* error) {
+  std::ofstream file(path);
+  if (!file.is_open()) {
+    if (error != nullptr) {
+      *error = "Failed to open file: " + path;
+    }
+    return false;
+  }
+
+  // 写入表头
+  file << "# Loop Pose Errors\n";
+  file << "# image_id1, image_id2, image_name1, image_name2, "
+       << "rot_error_deg, trans_error, trans_dir_error_deg, "
+       << "q_est_w, q_est_x, q_est_y, q_est_z, t_est_x, t_est_y, t_est_z, "
+       << "q_gt_w, q_gt_x, q_gt_y, q_gt_z, t_gt_x, t_gt_y, t_gt_z\n";
+
+  file << std::fixed << std::setprecision(6);
+
+  // 写入每条误差记录
+  for (const auto& err : errors) {
+    file << err.image_id1 << ", " << err.image_id2 << ", "
+         << err.image_name1 << ", " << err.image_name2 << ", "
+         << err.rot_error_deg << ", " << err.trans_error << ", "
+         << err.trans_error_normalized << ", "
+         << err.q_est.w() << ", " << err.q_est.x() << ", "
+         << err.q_est.y() << ", " << err.q_est.z() << ", "
+         << err.t_est.x() << ", " << err.t_est.y() << ", " << err.t_est.z() << ", "
+         << err.q_gt.w() << ", " << err.q_gt.x() << ", "
+         << err.q_gt.y() << ", " << err.q_gt.z() << ", "
+         << err.t_gt.x() << ", " << err.t_gt.y() << ", " << err.t_gt.z() << "\n";
+  }
+
+  // 写入统计信息
+  if (!errors.empty()) {
+    double sum_rot = 0.0, sum_trans = 0.0, sum_trans_dir = 0.0;
+    double max_rot = 0.0, max_trans = 0.0, max_trans_dir = 0.0;
+    for (const auto& err : errors) {
+      sum_rot += err.rot_error_deg;
+      sum_trans += err.trans_error;
+      sum_trans_dir += err.trans_error_normalized;
+      max_rot = std::max(max_rot, err.rot_error_deg);
+      max_trans = std::max(max_trans, err.trans_error);
+      max_trans_dir = std::max(max_trans_dir, err.trans_error_normalized);
+    }
+    const size_t n = errors.size();
+    file << "# Statistics:\n";
+    file << "# Total loop edges: " << n << "\n";
+    file << "# Mean rot error (deg): " << (sum_rot / n) << "\n";
+    file << "# Mean trans error: " << (sum_trans / n) << "\n";
+    file << "# Mean trans dir error (deg): " << (sum_trans_dir / n) << "\n";
+    file << "# Max rot error (deg): " << max_rot << "\n";
+    file << "# Max trans error: " << max_trans << "\n";
+    file << "# Max trans dir error (deg): " << max_trans_dir << "\n";
+  }
+
+  file.close();
+  return true;
+}
+
+/**
+ * [功能描述]：评估回环边相对位姿与真值的误差，并输出到文件
+ * @param reconstruction：当前重建结果（用于计算相对位姿）
+ * @param gt_reconstruction：真值重建
+ * @param edges：位姿图边列表
+ * @param output_path：输出文件路径
+ * @return 成功返回true，失败返回false
+ */
+bool EvaluateAndWriteLoopPoseErrors(
+    const Reconstruction& reconstruction,
+    const Reconstruction& gt_reconstruction,
+    const std::vector<PoseGraphEdge>& edges,
+    const std::string& output_path) {
+  std::vector<LoopPoseError> loop_errors;
+
+  // 遍历所有边，只处理回环边
+  for (const auto& edge : edges) {
+    if (edge.type != EdgeType::kLoop) {
+      continue;
+    }
+
+    // 检查图像是否存在
+    if (!reconstruction.ExistsImage(edge.image_id1) ||
+        !reconstruction.ExistsImage(edge.image_id2)) {
+      continue;
+    }
+
+    const Image& image_i = reconstruction.Image(edge.image_id1);
+    const Image& image_j = reconstruction.Image(edge.image_id2);
+
+    // 从重建中计算相对位姿
+    Eigen::Vector4d qvec_ij;
+    Eigen::Vector3d tvec_ij;
+    ComputeRelativePose(image_i.Qvec(), image_i.Tvec(),
+                        image_j.Qvec(), image_j.Tvec(),
+                        &qvec_ij, &tvec_ij);
+    Eigen::Quaterniond q_ij(qvec_ij(0), qvec_ij(1), qvec_ij(2), qvec_ij(3));
+
+    // 计算与真值的误差
+    LoopPoseError error;
+    if (ComputeLoopPoseError(gt_reconstruction, image_i, image_j,
+                             q_ij, tvec_ij, &error)) {
+      loop_errors.push_back(error);
+    }
+  }
+
+  // 如果没有有效的误差记录，返回
+  if (loop_errors.empty()) {
+    std::cout << "No valid loop edges for GT comparison.\n";
+    return false;
+  }
+
+  // 输出误差文件
+  std::string write_error;
+  if (!WriteLoopPoseErrorsToFile(output_path, loop_errors, &write_error)) {
+    std::cout << "Failed to write loop pose errors: " << write_error << "\n";
+    return false;
+  }
+
+  // 计算并输出统计信息
+  double sum_rot = 0.0, sum_trans = 0.0, sum_trans_dir = 0.0;
+  for (const auto& err : loop_errors) {
+    sum_rot += err.rot_error_deg;
+    sum_trans += err.trans_error;
+    sum_trans_dir += err.trans_error_normalized;
+  }
+  const size_t n = loop_errors.size();
+
+  std::cout << "Wrote loop pose errors to: " << output_path << "\n";
+  std::cout << "Loop pose error statistics:\n";
+  std::cout << "  Total loop edges with GT: " << n << "\n";
+  std::cout << "  Mean rotation error: " << (sum_rot / n) << " deg\n";
+  std::cout << "  Mean translation error: " << (sum_trans / n) << " m\n";
+  std::cout << "  Mean translation direction error: " << (sum_trans_dir / n) << " deg\n";
+
+  return true;
+}
+
+/**
  * [功能描述]：从重建结果构建里程计边（按快照排序，连接后续N帧）
  * @param reconstruction：3D重建结果
  * @param defaults：边的默认参数配置
@@ -2147,10 +2452,22 @@ std::vector<PoseGraphEdge> BuildLoopEdges(
   return edges;
 }
 
+/**
+ * [功能描述]：使用Sim3变换构建回环边
+ * @param reconstruction：当前3D重建结果
+ * @param database：特征数据库
+ * @param options：管线选项
+ * @param occupied_pairs：已占用的图像对（输入输出）
+ * @param gt_reconstruction：真值重建（可选，用于误差评估）
+ * @param loop_errors：回环误差列表（可选，用于存储误差）
+ * @return 回环边列表
+ */
 std::vector<PoseGraphEdge> BuildLoopEdgesSim3(
     const Reconstruction& reconstruction, Database* database,
     const PipelineOptions& options,
-    std::unordered_set<image_pair_t>* occupied_pairs) {
+    std::unordered_set<image_pair_t>* occupied_pairs,
+    const Reconstruction* gt_reconstruction = nullptr,
+    std::vector<LoopPoseError>* loop_errors = nullptr) {
   // 从数据库读取所有两视图几何
   std::vector<image_pair_t> image_pair_ids;
   std::vector<TwoViewGeometry> two_view_geometries;
@@ -2296,6 +2613,15 @@ std::vector<PoseGraphEdge> BuildLoopEdgesSim3(
       edge.q_ij = q_ij_sim3;
       edge.t_ij = t_ij_sim3;
       edge.translation_is_unit = false;
+
+      // 如果提供了真值重建，计算并记录回环相对位姿误差
+      if (gt_reconstruction != nullptr && loop_errors != nullptr) {
+        LoopPoseError error;
+        if (ComputeLoopPoseError(*gt_reconstruction, image_i, image_j,
+                                 q_ij_sim3, t_ij_sim3, &error)) {
+          loop_errors->push_back(error);
+        }
+      }
     } else {
       // 无法估计尺度则跳过该边
       continue;
@@ -2601,6 +2927,11 @@ bool ParseArgs(int argc, char** argv, PipelineOptions* options) {
       options->image_path = argv[++i];
       continue;
     }
+    // 可选参数：真值重建路径（用于评估回环相对位姿误差）
+    if (arg == "--gt-reconstruction" && i + 1 < argc) {
+      options->gt_reconstruction_path = argv[++i];
+      continue;
+    }
     // 未知选项报错
     if (arg.rfind("--", 0) == 0) {
       std::cout << "Unknown option: " << arg << "\n";
@@ -2868,6 +3199,24 @@ int main(int argc, char** argv) {
 
   Database database(options.database_path);
 
+  // ========== 2.1. 加载真值重建（可选，用于回环误差评估） ==========
+  std::unique_ptr<Reconstruction> gt_reconstruction;
+  const bool use_gt_reconstruction = !options.gt_reconstruction_path.empty();
+  if (use_gt_reconstruction) {
+    gt_reconstruction = std::make_unique<Reconstruction>();
+    gt_reconstruction->Read(options.gt_reconstruction_path);
+    if (gt_reconstruction->RegImageIds().empty()) {
+      std::cout << "WARNING: GT reconstruction has no registered images.\n";
+      gt_reconstruction.reset();
+    } else {
+      std::cout << "Loaded GT reconstruction with "
+                << gt_reconstruction->NumRegImages() << " images.\n";
+    }
+  }
+
+  // 用于存储回环相对位姿误差
+  std::vector<LoopPoseError> loop_pose_errors;
+
   // ========== 3. 读取rig配置（可选） ==========
   std::vector<CameraRig> camera_rigs;
   const bool use_rig = !options.rig_config_path.empty();
@@ -3069,8 +3418,9 @@ int main(int argc, char** argv) {
 
     // 自动构建回环边
     if (options.build_loop_edges) {
-      auto loop_edges =
-          BuildLoopEdgesSim3(reconstruction, &database, options, &occupied_pairs);
+      auto loop_edges = BuildLoopEdgesSim3(
+          reconstruction, &database, options, &occupied_pairs,
+          gt_reconstruction.get(), &loop_pose_errors);
       edges.insert(edges.end(), loop_edges.begin(), loop_edges.end());
     }
 
@@ -3154,6 +3504,15 @@ int main(int argc, char** argv) {
               edge.q_ij = q_ij_sim3;
               edge.t_ij = t_ij_sim3;
               edge.translation_is_unit = false;
+
+              // 如果提供了真值重建，计算并记录回环相对位姿误差
+              if (gt_reconstruction != nullptr) {
+                LoopPoseError error;
+                if (ComputeLoopPoseError(*gt_reconstruction, image_i, image_j,
+                                         q_ij_sim3, t_ij_sim3, &error)) {
+                  loop_pose_errors.push_back(error);
+                }
+              }
             } else {
               // 无法估计尺度则跳过该边
               continue;
@@ -3179,6 +3538,31 @@ int main(int argc, char** argv) {
         std::cout << "Failed to write edge output: " << error << "\n";
       } else {
         std::cout << "Wrote edge file: " << options.edge_output_path << "\n";
+      }
+    }
+
+    // 保存回环相对位姿误差到文件（如果有真值重建）
+    if (gt_reconstruction != nullptr && !loop_pose_errors.empty()) {
+      const std::string loop_error_path = JoinPaths(options.output_path, "loop_pose_errors.txt");
+      std::string error;
+      if (!WriteLoopPoseErrorsToFile(loop_error_path, loop_pose_errors, &error)) {
+        std::cout << "Failed to write loop pose errors: " << error << "\n";
+      } else {
+        std::cout << "Wrote loop pose errors to: " << loop_error_path << "\n";
+        // 输出统计信息
+        double sum_rot = 0.0, sum_trans = 0.0, sum_trans_dir = 0.0;
+        for (const auto& err : loop_pose_errors) {
+          sum_rot += err.rot_error_deg;
+          sum_trans += err.trans_error;
+          sum_trans_dir += err.trans_error_normalized;
+        }
+        const size_t n = loop_pose_errors.size();
+        std::cout << "Loop pose error statistics:\n";
+        std::cout << "  Total loop edges with GT: " << n << "\n";
+        std::cout << "  Mean rotation error: " << (sum_rot / n) << " deg\n";
+        std::cout << "  Mean translation error: " << (sum_trans / n) << " m\n";
+        std::cout << "  Mean translation direction error: "
+                  << (sum_trans_dir / n) << " deg\n";
       }
     }
   }
@@ -3232,6 +3616,14 @@ int main(int argc, char** argv) {
     Eigen::Vector3d t = t_rel + q_rel * t_base;
     image.SetQvec(Eigen::Vector4d(q.w(), q.x(), q.y(), q.z()));
     image.SetTvec(t);
+  }
+
+  // 如果有真值重建，输出PGO后的回环相对位姿与真值重建中回环的相对位姿的误差
+  if (gt_reconstruction != nullptr) {
+    const std::string post_pgo_error_path =
+        JoinPaths(options.output_path, "loop_pose_errors_after_pgo.txt");
+    EvaluateAndWriteLoopPoseErrors(reconstruction, *gt_reconstruction, edges,
+                                   post_pgo_error_path);
   }
 
   // // ========== 9. 三角化与迭代优化 ==========
