@@ -2595,24 +2595,71 @@ std::vector<PoseGraphEdge> BuildLoopEdgesSim3(
       continue;
     }
 
-    // 构建回环边
-    PoseGraphEdge edge;
-    edge.type = EdgeType::kLoop;
-    edge.image_id1 = i;
-    edge.image_id2 = j;
+    bool added_any = false;
+
+    // 先添加平移方向约束（不包含旋转）
+    Eigen::Quaterniond q_ij_dir = Eigen::Quaterniond::Identity();
+    Eigen::Vector3d t_ij_dir = Eigen::Vector3d::Zero();
+    bool has_dir = false;
+    // 判断数据库中是否已有相对位姿，如果有且有效则直接使用，否则重新估计
+    if (geom.qvec.squaredNorm() > 1e-12 && geom.tvec.squaredNorm() > 1e-12) {
+      const Eigen::Vector4d normalized_qvec = NormalizeQuaternion(geom.qvec);
+      q_ij_dir = Eigen::Quaterniond(normalized_qvec(0), normalized_qvec(1),
+                                    normalized_qvec(2), normalized_qvec(3));
+      t_ij_dir = geom.tvec.normalized();
+      has_dir = true;
+    } else {
+      if (EstimateRelativePoseFromInliers(geom, image_i, image_j, camera_i,
+                                          camera_j, database, &points_cache,
+                                          &q_ij_dir, &t_ij_dir)) {
+        has_dir = true;
+      }
+    }
+
+    // 如果有有效的平移方向约束，则添加一个只包含平移方向的边（旋转权重为0），以提供额外的约束信息
+    if (has_dir && t_ij_dir.squaredNorm() > 1e-12) {
+      // TODO: 是否需要将平移方向反向，使其与重建中相对位姿的平移方向一致???
+      // Eigen::Vector4d qvec_pred;
+      // Eigen::Vector3d tvec_pred;
+      // ComputeRelativePose(image_i.Qvec(), image_i.Tvec(), image_j.Qvec(),
+      //                     image_j.Tvec(), &qvec_pred, &tvec_pred);
+      // if (tvec_pred.squaredNorm() > 1e-12 &&
+      //     t_ij_dir.dot(tvec_pred) < 0) {
+      //   t_ij_dir = -t_ij_dir;
+      // }
+
+      // 平移方向边只包含单位化的平移约束，旋转约束权重为0
+      PoseGraphEdge dir_edge;
+      dir_edge.type = EdgeType::kLoop;
+      dir_edge.image_id1 = i;
+      dir_edge.image_id2 = j;
+      dir_edge.q_ij = Eigen::Quaterniond::Identity();
+      dir_edge.t_ij = t_ij_dir.normalized();
+      dir_edge.translation_is_unit = true;
+      dir_edge.rot_weight = 0.0;
+      dir_edge.trans_weight = options.defaults.loop_trans_weight;
+      edges.push_back(dir_edge);
+      added_any = true;
+    }
+
+    // 构建回环Sim3边（旋转+平移）
     double loop_scale = 0.0;
     Eigen::Quaterniond q_ij_sim3;
     Eigen::Vector3d t_ij_sim3;
     if (EstimateLoopScaleFromPointPairsSim3(reconstruction, geom, image_i,
                                             image_j,
                                             &loop_scale, q_ij_sim3, t_ij_sim3)) {
-      // 只使用尺度信息调整平移向量
-      // edge.t_ij = t_ij_dir * loop_scale;
-      // edge.translation_is_unit = false;
-      // 直接使用sim3估计出来的旋转和平移
+      PoseGraphEdge edge;
+      edge.type = EdgeType::kLoop;
+      edge.image_id1 = i;
+      edge.image_id2 = j;
       edge.q_ij = q_ij_sim3;
       edge.t_ij = t_ij_sim3;
       edge.translation_is_unit = false;
+      edge.rot_weight = options.defaults.loop_rot_weight;
+      edge.trans_weight = options.defaults.loop_trans_weight;
+      edges.push_back(edge);
+      added_any = true;
 
       // 如果提供了真值重建，计算并记录回环相对位姿误差
       if (gt_reconstruction != nullptr && loop_errors != nullptr) {
@@ -2622,17 +2669,178 @@ std::vector<PoseGraphEdge> BuildLoopEdgesSim3(
           loop_errors->push_back(error);
         }
       }
-    } else {
-      // 无法估计尺度则跳过该边
+    }
+
+    if (!added_any) {
       continue;
     }
-    edge.rot_weight = options.defaults.loop_rot_weight;
-    edge.trans_weight = options.defaults.loop_trans_weight;
 
-    edges.push_back(edge);
     occupied_pairs->insert(pair_id);  // 标记该对已使用
     loop_degree[i] += 1;
     loop_degree[j] += 1;
+  }
+
+  return edges;
+}
+
+std::vector<PoseGraphEdge> BuildManualLoopEdgesWithConstraints(
+    const Reconstruction& reconstruction, Database* database,
+    const PipelineOptions& options, const std::string& manual_loop_path,
+    std::unordered_set<image_pair_t>* occupied_pairs,
+    const Reconstruction* gt_reconstruction = nullptr,
+    std::vector<LoopPoseError>* loop_errors = nullptr) {
+  std::vector<PoseGraphEdge> edges;
+  if (manual_loop_path.empty()) {
+    return edges;
+  }
+
+  // 读取手动指定的回环边
+  std::vector<PoseGraphEdge> manual_edges;
+  std::string error;
+  if (!ReadPoseGraphEdgesFromFile(manual_loop_path, options.defaults,
+                                  &manual_edges, &error)) {
+    std::cout << "Failed to read manual loop edges: " << error << "\n";
+    return edges;
+  }
+
+  // 点的缓存,避免重复读取
+  std::unordered_map<image_t, std::vector<Eigen::Vector2d>> points_cache;
+  points_cache.reserve(reconstruction.RegImageIds().size());
+
+  size_t added_pairs = 0;
+  for (auto& edge : manual_edges) {
+    if (edge.type == EdgeType::kOdom) {
+      continue;  // 跳过里程计类型
+    }
+    edge.type = EdgeType::kLoop;
+    if (!reconstruction.ExistsImage(edge.image_id1) ||
+        !reconstruction.ExistsImage(edge.image_id2)) {
+      continue;
+    }
+
+    const image_pair_t pair_id =
+        Database::ImagePairToPairId(edge.image_id1, edge.image_id2);
+    if (occupied_pairs != nullptr && occupied_pairs->count(pair_id) > 0) {
+      continue;  // 跳过已存在的边
+    }
+
+    const Image& image_i = reconstruction.Image(edge.image_id1);
+    const Image& image_j = reconstruction.Image(edge.image_id2);
+    const Camera& camera_i = reconstruction.Camera(image_i.CameraId());
+    const Camera& camera_j = reconstruction.Camera(image_j.CameraId());
+
+    TwoViewGeometry geom =
+        database->ReadTwoViewGeometry(edge.image_id1, edge.image_id2);
+
+    bool added_any = false;
+
+    // 平移方向约束（不包含旋转）
+    Eigen::Vector3d t_ij_dir = edge.t_ij;
+    bool has_dir = t_ij_dir.squaredNorm() > 1e-12;
+    if (!has_dir) {
+      if (geom.qvec.squaredNorm() > 1e-12 && geom.tvec.squaredNorm() > 1e-12) {
+        t_ij_dir = geom.tvec.normalized();
+        has_dir = true;
+      } else {
+        Eigen::Quaterniond q_ij_est;
+        Eigen::Vector3d t_ij_dir_est;
+        if (EstimateRelativePoseFromInliers(geom, image_i, image_j, camera_i,
+                                            camera_j, database, &points_cache,
+                                            &q_ij_est, &t_ij_dir_est)) {
+          t_ij_dir = t_ij_dir_est;
+          has_dir = true;
+        }
+      }
+    }
+
+    if (has_dir && t_ij_dir.squaredNorm() > 1e-12) {
+      t_ij_dir.normalize();
+      // TODO: 是否需要将平移方向反向，使其与重建中相对位姿的平移方向一致???
+      // Eigen::Vector4d qvec_pred;
+      // Eigen::Vector3d tvec_pred;
+      // ComputeRelativePose(image_i.Qvec(), image_i.Tvec(), image_j.Qvec(),
+      //                     image_j.Tvec(), &qvec_pred, &tvec_pred);
+      // if (tvec_pred.squaredNorm() > 1e-12 &&
+      //     t_ij_dir.dot(tvec_pred) < 0) {
+      //   t_ij_dir = -t_ij_dir;
+      // }
+
+      PoseGraphEdge dir_edge;
+      dir_edge.type = EdgeType::kLoop;
+      dir_edge.image_id1 = edge.image_id1;
+      dir_edge.image_id2 = edge.image_id2;
+      dir_edge.q_ij = Eigen::Quaterniond::Identity();
+      dir_edge.t_ij = t_ij_dir;
+      dir_edge.translation_is_unit = true;
+      dir_edge.rot_weight = 0.0;
+      dir_edge.trans_weight = options.defaults.loop_trans_weight;
+      edges.push_back(dir_edge);
+      added_any = true;
+    }
+
+    // Sim3约束（旋转+平移）
+    double loop_scale = 0.0;
+    Eigen::Quaterniond q_ij_sim3;
+    Eigen::Vector3d t_ij_sim3;
+    if (EstimateLoopScaleFromPointPairsSim3(reconstruction, geom, image_i,
+                                            image_j, &loop_scale, q_ij_sim3,
+                                            t_ij_sim3)) {
+      PoseGraphEdge sim3_edge;
+      sim3_edge.type = EdgeType::kLoop;
+      sim3_edge.image_id1 = edge.image_id1;
+      sim3_edge.image_id2 = edge.image_id2;
+      sim3_edge.q_ij = q_ij_sim3;
+      sim3_edge.t_ij = t_ij_sim3;
+      sim3_edge.translation_is_unit = false;
+      sim3_edge.rot_weight = options.defaults.loop_rot_weight;
+      sim3_edge.trans_weight = options.defaults.loop_trans_weight;
+      edges.push_back(sim3_edge);
+      added_any = true;
+
+      // 如果有真值重建，计算与真值重建的相对位姿误差
+      if (gt_reconstruction != nullptr && loop_errors != nullptr) {
+        LoopPoseError error_out;
+        if (ComputeLoopPoseError(*gt_reconstruction, image_i, image_j,
+                                 q_ij_sim3, t_ij_sim3, &error_out)) {
+          loop_errors->push_back(error_out);
+        }
+      }
+    } else if (!edge.translation_is_unit &&
+               edge.q_ij.squaredNorm() > 1e-12 &&
+               edge.t_ij.squaredNorm() > 1e-12) {
+      // 无法估计Sim3时，退化为使用手动提供的全量约束
+      PoseGraphEdge full_edge = edge;
+      full_edge.type = EdgeType::kLoop;
+      full_edge.translation_is_unit = false;
+      full_edge.rot_weight = options.defaults.loop_rot_weight;
+      full_edge.trans_weight = options.defaults.loop_trans_weight;
+      edges.push_back(full_edge);
+      added_any = true;
+
+      // 如果有真值重建，计算与真值重建的相对位姿误差
+      if (gt_reconstruction != nullptr && loop_errors != nullptr) {
+        LoopPoseError error_out;
+        if (ComputeLoopPoseError(*gt_reconstruction, image_i, image_j,
+                                 full_edge.q_ij, full_edge.t_ij,
+                                 &error_out)) {
+          loop_errors->push_back(error_out);
+        }
+      }
+    }
+
+    if (!added_any) {
+      continue;
+    }
+
+    if (occupied_pairs != nullptr) {
+      occupied_pairs->insert(pair_id);
+    }
+    added_pairs += 1;
+  }
+
+  if (!edges.empty()) {
+    std::cout << "Added manual loop edges: " << edges.size()
+              << " (pairs=" << added_pairs << ")\n";
   }
 
   return edges;
@@ -3055,21 +3263,6 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
     std::cout << "  => Filtered observations (strict): " << filtered_obs
               << "\n";
   }
-  // 过滤掉观测数量小于kMinTrackLength的3D点
-  const auto point3D_ids = reconstruction->Point3DIds();
-  size_t removed_tracks = 0;
-  for (const auto point3D_id : point3D_ids) {
-    if (!reconstruction->ExistsPoint3D(point3D_id)) {
-      continue;
-    }
-    if (reconstruction->Point3D(point3D_id).Track().Length() < kMinTrackLength) {
-      reconstruction->DeletePoint3D(point3D_id);
-      removed_tracks += 1;
-    }
-  }
-  if (removed_tracks > 0) {
-    std::cout << "  => Removed short tracks: " << removed_tracks << "\n";
-  }
 
   auto ba_options = mapper_options.GlobalBundleAdjustment();
   ba_options.refine_focal_length = false;
@@ -3127,23 +3320,6 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
       const size_t iter_filtered = reconstruction->FilterAllPoints3D(kStrictMaxReprojError, kStrictMinTriAngle);
       if (iter_filtered > 0) {
         std::cout << "  => Filtered observations (strict): " << iter_filtered
-                  << "\n";
-      }
-      // 过滤掉观测数量小于kMinTrackLength的3D点
-      const auto iter_point3D_ids = reconstruction->Point3DIds();
-      size_t iter_removed_tracks = 0;
-      for (const auto point3D_id : iter_point3D_ids) {
-        if (!reconstruction->ExistsPoint3D(point3D_id)) {
-          continue;
-        }
-        if (reconstruction->Point3D(point3D_id).Track().Length() <
-            kMinTrackLength) {
-          reconstruction->DeletePoint3D(point3D_id);
-          iter_removed_tracks += 1;
-        }
-      }
-      if (iter_removed_tracks > 0) {
-        std::cout << "  => Removed short tracks: " << iter_removed_tracks
                   << "\n";
       }
       const double changed =
@@ -3426,109 +3602,10 @@ int main(int argc, char** argv) {
 
     // 添加手动指定的回环边
     if (!options.manual_loop_path.empty()) {
-      std::vector<PoseGraphEdge> manual_edges;
-      std::string error;
-      if (ReadPoseGraphEdgesFromFile(options.manual_loop_path, options.defaults,
-                                     &manual_edges, &error)) {
-        // 点的缓存,避免重复读取
-        std::unordered_map<image_t, std::vector<Eigen::Vector2d>> points_cache;
-        points_cache.reserve(reconstruction.RegImageIds().size());
-
-        size_t added_manual = 0;
-        for (auto& edge : manual_edges) {
-          if (edge.type == EdgeType::kOdom) {
-            continue;  // 跳过里程计类型
-          }
-          edge.type = EdgeType::kLoop;
-          if (!reconstruction.ExistsImage(edge.image_id1) ||
-              !reconstruction.ExistsImage(edge.image_id2)) {
-            continue;
-          }
-
-          const image_pair_t pair_id =
-              Database::ImagePairToPairId(edge.image_id1, edge.image_id2);
-          if (occupied_pairs.count(pair_id) > 0) {
-            continue;  // 跳过已存在的边
-          }
-
-          // 获取对应的图像和相机
-          const Image& image_i = reconstruction.Image(edge.image_id1);
-          const Image& image_j = reconstruction.Image(edge.image_id2);
-          const Camera& camera_i = reconstruction.Camera(image_i.CameraId());
-          const Camera& camera_j = reconstruction.Camera(image_j.CameraId());
-
-          // 获取图像对的双视图几何
-          TwoViewGeometry geom =
-              database.ReadTwoViewGeometry(edge.image_id1, edge.image_id2);
-
-          // 获取图像对的相对位姿
-          Eigen::Quaterniond q_ij = edge.q_ij;
-          Eigen::Vector3d t_ij_dir = edge.t_ij;
-
-          // 如果边中没有位姿信息，则尝试从几何中恢复
-          if (q_ij.squaredNorm() < 1e-12 ||
-              t_ij_dir.squaredNorm() < 1e-12) {
-            if (geom.qvec.squaredNorm() > 1e-12 &&
-                geom.tvec.squaredNorm() > 1e-12) {
-              const Eigen::Vector4d normalized_qvec =
-                  NormalizeQuaternion(geom.qvec);
-              q_ij = Eigen::Quaterniond(normalized_qvec(0), normalized_qvec(1),
-                                        normalized_qvec(2), normalized_qvec(3));
-              t_ij_dir = geom.tvec.normalized();
-            } else {
-              Eigen::Quaterniond q_ij_est;
-              Eigen::Vector3d t_ij_dir_est;
-              if (EstimateRelativePoseFromInliers(
-                      geom, image_i, image_j, camera_i, camera_j, &database,
-                      &points_cache, &q_ij_est, &t_ij_dir_est)) {
-                q_ij = q_ij_est;
-                t_ij_dir = t_ij_dir_est;
-              }
-            }
-          }
-
-          // 如果是归一化的边,则尝试估计尺度
-          if (edge.translation_is_unit &&
-              t_ij_dir.squaredNorm() > 1e-12 &&
-              q_ij.squaredNorm() > 1e-12) {
-            double loop_scale = 0.0;
-            Eigen::Quaterniond q_ij_sim3;
-            Eigen::Vector3d t_ij_sim3;
-            if (EstimateLoopScaleFromPointPairsSim3(
-                    reconstruction, geom, image_i, image_j,
-                    &loop_scale, q_ij_sim3, t_ij_sim3)) {
-              // 只使用尺度信息调整平移向量
-              // edge.t_ij = t_ij_dir * loop_scale;
-              // edge.translation_is_unit = false;
-              // 直接使用sim3估计出来的旋转和平移
-              edge.q_ij = q_ij_sim3;
-              edge.t_ij = t_ij_sim3;
-              edge.translation_is_unit = false;
-
-              // 如果提供了真值重建，计算并记录回环相对位姿误差
-              if (gt_reconstruction != nullptr) {
-                LoopPoseError error;
-                if (ComputeLoopPoseError(*gt_reconstruction, image_i, image_j,
-                                         q_ij_sim3, t_ij_sim3, &error)) {
-                  loop_pose_errors.push_back(error);
-                }
-              }
-            } else {
-              // 无法估计尺度则跳过该边
-              continue;
-            }
-          }
-
-          if (q_ij.squaredNorm() > 1e-12) {
-            edge.q_ij = q_ij;
-          }
-          occupied_pairs.insert(pair_id);
-          edges.push_back(edge);
-          added_manual += 1;
-        }
-        std::cout << "Added manual loop edges: " << added_manual
-                  << "\n";
-      }
+      auto manual_edges = BuildManualLoopEdgesWithConstraints(
+          reconstruction, &database, options, options.manual_loop_path,
+          &occupied_pairs, gt_reconstruction.get(), &loop_pose_errors);
+      edges.insert(edges.end(), manual_edges.begin(), manual_edges.end());
     }
 
     // 保存构建的边到文件
