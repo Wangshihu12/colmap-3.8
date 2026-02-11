@@ -620,7 +620,7 @@ struct EdgeDefaults {
   double odom_rot_weight = 2.0;
   double odom_trans_weight = 2.0;
   double loop_rot_weight = 1.0;
-  double loop_trans_weight = 1.0;
+  double loop_trans_weight = 2.0;
   double rig_rot_weight = 5.0;
   double rig_trans_weight = 5.0;
   bool odom_translation_is_unit = false;
@@ -642,6 +642,16 @@ struct PoseGraphEdge {
 struct ImagePoseParams {
   double* base_pose = nullptr;  // 不同快照下的相机基准位姿
   double* rel_pose = nullptr;   // 统一快照，不同相机的相对位姿
+};
+
+struct Sim3EstimationOptions {
+  size_t min_point_pairs = 12;
+  double max_reproj_error_px = 8.0;
+  size_t min_track_length = 3;
+  double max_depth_ratio = 10.0;
+  // 如果小于0，则自动使用深度中间值乘以 max_depth_ratio 作为阈值
+  double ransac_max_error = -1.0;
+  double ransac_min_inlier_ratio = 0.25;
 };
 
 struct PipelineOptions {
@@ -666,6 +676,7 @@ struct PipelineOptions {
   double min_loop_tri_angle_deg = 5.0;
   size_t max_loop_edges_per_image = 30;
   EdgeDefaults defaults;
+  Sim3EstimationOptions sim3_options;
 };
 
 bool IsNumericToken(const std::string& token) {
@@ -1418,6 +1429,7 @@ bool EstimateRelativePoseFromInliers(
  * @param geom：两视图几何信息（包含内点匹配）
  * @param image_i：第一幅图像
  * @param image_j：第二幅图像
+ * @param options：Sim3估计参数（过滤与RANSAC阈值）
  * @param scale：输出参数，估计得到的尺度
  * @param q_ij_out：输出参数，估计得到的相对旋转四元数
  * @param t_ij_out：输出参数，估计得到的相对平移
@@ -1426,18 +1438,20 @@ bool EstimateRelativePoseFromInliers(
 bool EstimateLoopScaleFromPointPairsSim3(
     const Reconstruction& reconstruction, const TwoViewGeometry& geom,
     const Image& image_i, const Image& image_j,
-    double* scale, Eigen::Quaterniond& q_ij_out, Eigen::Vector3d& t_ij_out) {
+    const Sim3EstimationOptions& options, double* scale,
+    Eigen::Quaterniond& q_ij_out, Eigen::Vector3d& t_ij_out) {
   if (scale == nullptr) {
     return false;
   }
 
-  const size_t kMinPointPairs = 12;  // 最少匹配点对数
+  const size_t kMinPointPairs = std::max<size_t>(1, options.min_point_pairs);
   const double kMinDepth = 1e-6;  // 最小深度阈值
   const double kMinAbsTransCos = 0.2;  // 最小绝对平移余弦值
   const double kMaxRotDiffRad = DegToRad(30.0);  // 最大旋转差异阈值
-  const double kMaxReprojErrorPx = 8.0;  // 最大重投影误差（像素）
-  const size_t kMinTrackLength = 3;  // 最小track长度（观测数量）
-  const double kMaxDepthRatio = 10.0;  // 最大深度比率（相对于中值深度）
+  const double kMaxReprojErrorPx =
+      std::max(1e-12, options.max_reproj_error_px);
+  const size_t kMinTrackLength = std::max<size_t>(1, options.min_track_length);
+  const double kMaxDepthRatio = std::max(1.0, options.max_depth_ratio);
 
   // 获取两幅图像对应的相机参数（用于计算重投影误差）
   const Camera& camera_i = reconstruction.Camera(image_i.CameraId());
@@ -1605,9 +1619,14 @@ bool EstimateLoopScaleFromPointPairsSim3(
 
   // 设置LORANSAC参数
   RANSACOptions ransac_options;
-  ransac_options.max_error =
-      std::max(1e-12, std::pow(0.05 * median_norm, 2));
-  ransac_options.min_inlier_ratio = 0.25;  // 提高内点比例要求
+  if (options.ransac_max_error > 0.0) {
+    ransac_options.max_error = options.ransac_max_error;
+  } else {
+    ransac_options.max_error =
+        std::max(1e-12, std::pow(0.05 * median_norm, 2));
+  }
+  ransac_options.min_inlier_ratio =
+      std::max(1e-6, options.ransac_min_inlier_ratio);
   ransac_options.confidence = 0.999;
   ransac_options.min_num_trials = 100;
   ransac_options.max_num_trials = 5000;  // 增加最大迭代次数
@@ -2646,9 +2665,9 @@ std::vector<PoseGraphEdge> BuildLoopEdgesSim3(
     double loop_scale = 0.0;
     Eigen::Quaterniond q_ij_sim3;
     Eigen::Vector3d t_ij_sim3;
-    if (EstimateLoopScaleFromPointPairsSim3(reconstruction, geom, image_i,
-                                            image_j,
-                                            &loop_scale, q_ij_sim3, t_ij_sim3)) {
+    if (EstimateLoopScaleFromPointPairsSim3(
+            reconstruction, geom, image_i, image_j, options.sim3_options,
+            &loop_scale, q_ij_sim3, t_ij_sim3)) {
       PoseGraphEdge edge;
       edge.type = EdgeType::kLoop;
       edge.image_id1 = i;
@@ -2782,9 +2801,9 @@ std::vector<PoseGraphEdge> BuildManualLoopEdgesWithConstraints(
     double loop_scale = 0.0;
     Eigen::Quaterniond q_ij_sim3;
     Eigen::Vector3d t_ij_sim3;
-    if (EstimateLoopScaleFromPointPairsSim3(reconstruction, geom, image_i,
-                                            image_j, &loop_scale, q_ij_sim3,
-                                            t_ij_sim3)) {
+    if (EstimateLoopScaleFromPointPairsSim3(
+            reconstruction, geom, image_i, image_j, options.sim3_options,
+            &loop_scale, q_ij_sim3, t_ij_sim3)) {
       PoseGraphEdge sim3_edge;
       sim3_edge.type = EdgeType::kLoop;
       sim3_edge.image_id1 = edge.image_id1;
@@ -3071,6 +3090,12 @@ void PrintUsage() {
          "  --odom-window <n>     Connect each frame to next n frames.\n"
          "  --skip-odom           Disable odometry edges.\n"
          "  --skip-loop           Disable auto loop edges.\n"
+         "  --sim3-min-point-pairs <n>        Min 3D-3D pairs for Sim3.\n"
+         "  --sim3-max-reproj-error <px>      Max reproj error in pixels.\n"
+         "  --sim3-min-track-length <n>       Min track length.\n"
+         "  --sim3-max-depth-ratio <r>        Max depth ratio to median.\n"
+         "  --sim3-ransac-max-error <v>       RANSAC max error (<=0 for auto).\n"
+         "  --sim3-ransac-min-inlier-ratio <r> RANSAC min inlier ratio.\n"
          "  --eval-threshold <px> Fail if mean reprojection error exceeds.\n"
          "  --self-test           Run IO self-test and exit.\n";
 }
@@ -3123,6 +3148,30 @@ bool ParseArgs(int argc, char** argv, PipelineOptions* options) {
     // 可选参数：里程计窗口大小
     if (arg == "--odom-window" && i + 1 < argc) {
       options->odom_window = std::stoul(argv[++i]);
+      continue;
+    }
+    if (arg == "--sim3-min-point-pairs" && i + 1 < argc) {
+      options->sim3_options.min_point_pairs = std::stoul(argv[++i]);
+      continue;
+    }
+    if (arg == "--sim3-max-reproj-error" && i + 1 < argc) {
+      options->sim3_options.max_reproj_error_px = std::stod(argv[++i]);
+      continue;
+    }
+    if (arg == "--sim3-min-track-length" && i + 1 < argc) {
+      options->sim3_options.min_track_length = std::stoul(argv[++i]);
+      continue;
+    }
+    if (arg == "--sim3-max-depth-ratio" && i + 1 < argc) {
+      options->sim3_options.max_depth_ratio = std::stod(argv[++i]);
+      continue;
+    }
+    if (arg == "--sim3-ransac-max-error" && i + 1 < argc) {
+      options->sim3_options.ransac_max_error = std::stod(argv[++i]);
+      continue;
+    }
+    if (arg == "--sim3-ransac-min-inlier-ratio" && i + 1 < argc) {
+      options->sim3_options.ransac_min_inlier_ratio = std::stod(argv[++i]);
       continue;
     }
     // 可选参数：评估阈值（像素）
@@ -3209,11 +3258,15 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
 
   // 使用增量建图的默认三角化/过滤参数
   IncrementalMapperOptions mapper_options;
-  mapper_options.ba_refine_focal_length = false;
+  mapper_options.ba_refine_focal_length = true;
   mapper_options.ba_refine_principal_point = false;
-  mapper_options.ba_refine_extra_params = false;
-  mapper_options.ba_global_max_refinements = 5; // 调整全局优化迭代次数
+  mapper_options.ba_refine_extra_params = true;
+  mapper_options.ba_global_max_refinements = 20; // 调整全局优化迭代次数
   mapper_options.ba_global_max_num_iterations = 50;
+  IncrementalMapper::Options mapper_filter_options =
+      mapper_options.Mapper();
+  mapper_filter_options.filter_max_reproj_error = 4.0;
+  mapper_filter_options.filter_min_tri_angle = 1.5;
   const double kStrictMaxReprojError = 3.0; // 严格的重投影误差阈值
   const double kStrictMinTriAngle = 2.5;    // 严格的最小三角化角度阈值（度）
   const size_t kMinTrackLength = 3;         // 最短轨迹长度阈值
@@ -3257,17 +3310,17 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
             << mapper.Retriangulate(tri_options) << "\n";
   // 过滤掉深度为负的观测点
   reconstruction->FilterObservationsWithNegativeDepth();
-  // 过滤掉重投影误差过大的观测点
-  const size_t filtered_obs = reconstruction->FilterAllPoints3D(kStrictMaxReprojError, kStrictMinTriAngle);
-  if (filtered_obs > 0) {
-    std::cout << "  => Filtered observations (strict): " << filtered_obs
-              << "\n";
-  }
+  // // 过滤掉重投影误差过大的观测点
+  // const size_t filtered_obs = reconstruction->FilterAllPoints3D(kStrictMaxReprojError, kStrictMinTriAngle);
+  // if (filtered_obs > 0) {
+  //   std::cout << "  => Filtered observations (strict): " << filtered_obs
+  //             << "\n";
+  // }
 
   auto ba_options = mapper_options.GlobalBundleAdjustment();
-  ba_options.refine_focal_length = false;
+  ba_options.refine_focal_length = true;
   ba_options.refine_principal_point = false;
-  ba_options.refine_extra_params = false;
+  ba_options.refine_extra_params = true;
   ba_options.refine_extrinsics = true;
 
   // 将所有已注册的图像添加到优化中
@@ -3315,13 +3368,17 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
       num_changed_observations +=
           CompleteAndMergeTracks(mapper_options, &mapper);
       // num_changed_observations += mapper.Retriangulate(tri_options);
-      num_changed_observations += FilterPoints(mapper_options, &mapper);
+      const size_t iter_filtered_observations =
+          mapper.FilterPoints(mapper_filter_options);
+      std::cout << "  => Filtered observations: "
+                << iter_filtered_observations << std::endl;
+      num_changed_observations += iter_filtered_observations;
       // 过滤掉重投影误差过大的观测点
-      const size_t iter_filtered = reconstruction->FilterAllPoints3D(kStrictMaxReprojError, kStrictMinTriAngle);
-      if (iter_filtered > 0) {
-        std::cout << "  => Filtered observations (strict): " << iter_filtered
-                  << "\n";
-      }
+      // const size_t iter_filtered = reconstruction->FilterAllPoints3D(kStrictMaxReprojError, kStrictMinTriAngle);
+      // if (iter_filtered > 0) {
+      //   std::cout << "  => Filtered observations (strict): " << iter_filtered
+      //             << "\n";
+      // }
       const double changed =
           num_observations == 0
               ? 0
@@ -3336,7 +3393,9 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
   }
 
   // 过滤图像
-  FilterImages(mapper_options, &mapper);
+  const size_t num_filtered_images =
+      mapper.FilterImages(mapper_filter_options);
+  std::cout << "  => Filtered images: " << num_filtered_images << std::endl;
 
   const bool kDiscardReconstruction = false;
   mapper.EndReconstruction(kDiscardReconstruction);
@@ -3703,11 +3762,11 @@ int main(int argc, char** argv) {
                                    post_pgo_error_path);
   }
 
-  // // ========== 9. 三角化与迭代优化 ==========
-  // if (!TriangulateAndOptimize(&reconstruction, &database,
-  //                             options.rig_config_path)) {
-  //   return -1;
-  // }
+  // ========== 9. 三角化与迭代优化 ==========
+  if (!TriangulateAndOptimize(&reconstruction, &database,
+                              options.rig_config_path)) {
+    return -1;
+  }
 
   // ========== 10. 评估并保存结果 ==========
   const double post_error = reconstruction.ComputeMeanReprojectionError();
