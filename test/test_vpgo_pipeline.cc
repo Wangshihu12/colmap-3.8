@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -23,6 +24,7 @@
 #include "base/database.h"
 #include "base/pose.h"
 #include "base/reconstruction.h"
+#include "base/scene_clustering.h"
 #include "controllers/bundle_adjustment.h"
 #include "controllers/incremental_mapper.h"
 #include "estimators/similarity_transform.h"
@@ -36,6 +38,7 @@
 #include "util/math.h"
 #include "util/misc.h"
 #include "util/string.h"
+#include "util/threading.h"
 
 using namespace colmap;
 
@@ -735,6 +738,93 @@ bool TryParseImageTimestamp(const std::string& name, double* timestamp) {
   }
   *timestamp = parsed;
   return true;
+}
+
+std::vector<image_t> GetOrderedRegImageIdsByTime(
+    const Reconstruction& reconstruction) {
+  std::vector<image_t> ordered = reconstruction.RegImageIds();
+  std::unordered_map<image_t, double> time_by_image;
+  time_by_image.reserve(ordered.size());
+  for (const auto image_id : ordered) {
+    const auto& image = reconstruction.Image(image_id);
+    double t = 0.0;
+    if (TryParseImageTimestamp(image.Name(), &t)) {
+      time_by_image[image_id] = t;
+    } else {
+      time_by_image[image_id] = static_cast<double>(image_id);
+    }
+  }
+  std::sort(ordered.begin(), ordered.end(),
+            [&](const image_t a, const image_t b) {
+              const double ta = time_by_image[a];
+              const double tb = time_by_image[b];
+              if (ta == tb) {
+                return a < b;
+              }
+              return ta < tb;
+            });
+  return ordered;
+}
+
+std::vector<std::vector<image_t>> BuildOverlappingClusters(
+    const std::vector<image_t>& ordered_ids,
+    const size_t cluster_size, const size_t overlap) {
+  std::vector<std::vector<image_t>> clusters;
+  if (ordered_ids.empty()) {
+    return clusters;
+  }
+  const size_t effective_cluster_size = std::max<size_t>(2, cluster_size);
+  const size_t effective_overlap =
+      std::min(overlap, effective_cluster_size - 1);
+  const size_t step = effective_cluster_size - effective_overlap;
+  for (size_t start = 0; start < ordered_ids.size(); start += step) {
+    const size_t end =
+        std::min(start + effective_cluster_size, ordered_ids.size());
+    if (end <= start) {
+      break;
+    }
+    std::vector<image_t> cluster(ordered_ids.begin() + start,
+                                 ordered_ids.begin() + end);
+    clusters.push_back(std::move(cluster));
+    if (end == ordered_ids.size()) {
+      break;
+    }
+  }
+  return clusters;
+}
+
+std::vector<std::vector<image_t>> BuildHierarchicalClusters(
+    const Reconstruction& reconstruction, const Database& database,
+    const SceneClustering::Options& clustering_options) {
+  std::vector<std::vector<image_t>> clusters;
+
+  SceneClustering scene_clustering =
+      SceneClustering::Create(clustering_options, database);
+  const auto leaf_clusters = scene_clustering.GetLeafClusters();
+
+  const auto reg_ids = reconstruction.RegImageIds();
+  std::unordered_set<image_t> reg_set(reg_ids.begin(), reg_ids.end());
+
+  for (const auto* cluster : leaf_clusters) {
+    if (cluster == nullptr) {
+      continue;
+    }
+    std::unordered_set<image_t> unique_ids;
+    unique_ids.reserve(cluster->image_ids.size());
+    for (const auto image_id : cluster->image_ids) {
+      if (reg_set.count(image_id) > 0) {
+        unique_ids.insert(image_id);
+      }
+    }
+    if (unique_ids.size() < 2) {
+      continue;
+    }
+    std::vector<image_t> ids(unique_ids.begin(), unique_ids.end());
+    std::sort(ids.begin(), ids.end());
+    clusters.push_back(std::move(ids));
+  }
+
+  return clusters;
 }
 
 std::string EdgeTypeToString(const EdgeType type) {
@@ -3399,6 +3489,443 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
 
   const bool kDiscardReconstruction = false;
   mapper.EndReconstruction(kDiscardReconstruction);
+  return true;
+}
+
+// 分块优化
+bool TriangulateAndOptimizeHierarchical(
+    Reconstruction* reconstruction, Database* database,
+    const std::string& rig_config_path) {
+  if (reconstruction == nullptr || database == nullptr) {
+    return false;
+  }
+
+  if (reconstruction->NumRegImages() < 2) {
+    std::cout << "Need at least two registered images for triangulation.\n";
+    return false;
+  }
+
+  // 分块参数（可根据数据规模调整）
+  const size_t kClusterSize = 200; // 子模型切分所需图像数量
+  const size_t kClusterOverlap = 50; // 子模型之间的图像重叠数量
+  const int kLocalMaxRefinements = 3; // 局部优化迭代次数
+
+  // 采用增量建图的默认参数作为基础
+  IncrementalMapperOptions mapper_options;
+  mapper_options.ba_refine_focal_length = true;
+  mapper_options.ba_refine_principal_point = false;
+  mapper_options.ba_refine_extra_params = true;
+  mapper_options.ba_global_max_refinements = 10;
+  mapper_options.ba_global_max_num_iterations = 50;
+
+  const double kLooseMaxReprojError = 4.0;
+  const double kLooseMinTriAngle = 1.5;
+  const double kStrictMaxReprojError = 3.0;
+  const double kStrictMinTriAngle = 1.5;
+  const size_t kMinTrackLength = 3;
+  const double kMergeMaxReprojError = 8.0;
+
+  // 宽松过滤参数
+  IncrementalMapper::Options mapper_filter_loose = mapper_options.Mapper();
+  mapper_filter_loose.filter_max_reproj_error = kLooseMaxReprojError;
+  mapper_filter_loose.filter_min_tri_angle = kLooseMinTriAngle;
+  // 严格过滤参数
+  IncrementalMapper::Options mapper_filter_strict = mapper_options.Mapper();
+  mapper_filter_strict.filter_max_reproj_error = kStrictMaxReprojError;
+  mapper_filter_strict.filter_min_tri_angle = kStrictMinTriAngle;
+
+  // 构建数据库缓存（所有子模型共享）
+  DatabaseCache database_cache;
+  const size_t min_num_matches = static_cast<size_t>(mapper_options.min_num_matches);
+  database_cache.Load(*database, min_num_matches,
+                      mapper_options.ignore_watermarks,
+                      mapper_options.image_names);
+
+  // 按 hierarchical 的 scene graph 分块
+  SceneClustering::Options clustering_options;
+  clustering_options.is_hierarchical = true;
+  clustering_options.branching = 2;
+  clustering_options.image_overlap = static_cast<int>(kClusterOverlap);
+  clustering_options.leaf_max_num_images = static_cast<int>(kClusterSize);
+  const auto clusters = BuildHierarchicalClusters(*reconstruction, *database,
+                                                  clustering_options);
+  if (clusters.empty()) {
+    std::cout << "No valid clusters for hierarchical optimization.\n";
+    return false;
+  }
+
+  // 并行构建子模型并做局部优化
+  std::vector<size_t> cluster_order(clusters.size());
+  std::iota(cluster_order.begin(), cluster_order.end(), 0);
+  // 按图像数量排序
+  // std::sort(cluster_order.begin(), cluster_order.end(),
+  //           [&](size_t a, size_t b) {
+  //             return clusters[a].size() > clusters[b].size();
+  //           });
+
+  // 获取有效线程，动态分配线程数
+  const int num_eff_threads = GetEffectiveNumThreads(ThreadPool::kMaxNumThreads);
+  const int kDefaultNumWorkers = 8;
+  const int num_eff_workers = std::max(
+      1, std::min(static_cast<int>(clusters.size()),
+                  std::min(kDefaultNumWorkers, num_eff_threads)));
+  const int num_threads_per_worker = std::max(1, num_eff_threads / num_eff_workers);
+
+  std::vector<Reconstruction> sub_reconstructions(clusters.size());
+  std::vector<bool> sub_success(clusters.size(), false);
+  std::atomic<bool> any_failed(false);
+  std::mutex error_mutex;
+  std::string error_msg;
+
+  auto ProcessCluster = [&](const size_t c) {
+    // 如果有线程失败了，终止所有后续的处理
+    if (any_failed.load()) {
+      return;
+    }
+
+    std::cout << "Building sub-model " << (c + 1) << " / " << clusters.size()
+              << " (images: " << clusters[c].size() << ")\n";
+
+    IncrementalMapperOptions local_options = mapper_options;
+    if (local_options.num_threads < 0) {
+      local_options.num_threads = num_threads_per_worker;
+    }
+    // 局部优化使用宽松的过滤参数
+    IncrementalMapper::Options mapper_filter_loose_local = local_options.Mapper();
+    mapper_filter_loose_local.filter_max_reproj_error = kLooseMaxReprojError;
+    mapper_filter_loose_local.filter_min_tri_angle = kLooseMinTriAngle;
+
+    // 从空模型构建当前子模型，避免拷贝整份重建导致峰值内存过高。
+    Reconstruction sub_rec;
+    std::unordered_set<camera_t> added_camera_ids;
+    added_camera_ids.reserve(clusters[c].size());
+    for (const auto image_id : clusters[c]) {
+      if (!reconstruction->ExistsImage(image_id)) {
+        continue;
+      }
+
+      const auto& src_image = reconstruction->Image(image_id);
+      const camera_t camera_id = src_image.CameraId();
+      if (added_camera_ids.insert(camera_id).second) {
+        if (!reconstruction->ExistsCamera(camera_id)) {
+          std::lock_guard<std::mutex> lock(error_mutex);
+          any_failed.store(true);
+          error_msg = "ERROR: missing camera for clustered image.";
+          return;
+        }
+        sub_rec.AddCamera(reconstruction->Camera(camera_id));
+      }
+
+      Image sub_image = src_image;
+      sub_image.SetRegistered(false);
+      for (point2D_t point2D_idx = 0; point2D_idx < sub_image.NumPoints2D();
+           ++point2D_idx) {
+        sub_image.ResetPoint3DForPoint2D(point2D_idx);
+      }
+      sub_rec.AddImage(std::move(sub_image));
+      sub_rec.RegisterImage(image_id);
+    }
+    if (sub_rec.NumRegImages() < 2) {
+      std::lock_guard<std::mutex> lock(error_mutex);
+      any_failed.store(true);
+      error_msg = "ERROR: cluster has fewer than two valid images.";
+      return;
+    }
+
+    IncrementalMapper mapper(&database_cache);
+    mapper.BeginReconstruction(&sub_rec);
+
+    const auto tri_options = local_options.Triangulation();
+    const auto& sub_reg_ids = sub_rec.RegImageIds();
+    for (const image_t image_id : sub_reg_ids) {
+      mapper.TriangulateImage(tri_options, image_id);
+    }
+
+    CompleteAndMergeTracks(local_options, &mapper);
+    mapper.Retriangulate(tri_options);
+    sub_rec.FilterObservationsWithNegativeDepth();
+
+    // 调整局部ba参数
+    BundleAdjustmentOptions ba_options_local = local_options.GlobalBundleAdjustment();
+    ba_options_local.refine_focal_length = true;
+    ba_options_local.refine_principal_point = false;
+    ba_options_local.refine_extra_params = true;
+    ba_options_local.refine_extrinsics = true;
+    ba_options_local.loss_function_type =
+        BundleAdjustmentOptions::LossFunctionType::SOFT_L1;
+    ba_options_local.loss_function_scale = 1.0;
+
+    BundleAdjustmentConfig ba_config;
+    for (const image_t image_id : sub_reg_ids) {
+      ba_config.AddImage(image_id);
+    }
+
+    // 读取相机rig配置
+    std::vector<CameraRig> camera_rigs;
+    RigBundleAdjuster::Options rig_ba_options;
+    if (!rig_config_path.empty()) {
+      std::string error;
+      if (!ReadCameraRigConfigFromFile(rig_config_path, sub_rec,
+                                       &camera_rigs, &error)) {
+        mapper.EndReconstruction(true);
+        std::lock_guard<std::mutex> lock(error_mutex);
+        any_failed.store(true);
+        error_msg = "Failed to read rig config: " + error;
+        return;
+      }
+    }
+
+    if (sub_rec.ComputeNumObservations() > 0) {
+      // 局部迭代优化
+      for (int i = 0; i < kLocalMaxRefinements; ++i) {
+        // 过滤负深度观测
+        sub_rec.FilterObservationsWithNegativeDepth();
+        const size_t num_observations = sub_rec.ComputeNumObservations();
+
+        // ba求解
+        RigBundleAdjuster bundle_adjuster(ba_options_local, rig_ba_options, ba_config);
+        if (!bundle_adjuster.Solve(&sub_rec, &camera_rigs)) {
+          mapper.EndReconstruction(true);
+          std::lock_guard<std::mutex> lock(error_mutex);
+          any_failed.store(true);
+          error_msg = "ERROR: local bundle adjustment failed.";
+          return;
+        }
+
+        // 观测变化
+        size_t num_changed_observations = 0;
+        num_changed_observations +=
+            CompleteAndMergeTracks(local_options, &mapper);
+        const size_t iter_filtered_observations =
+            mapper.FilterPoints(mapper_filter_loose_local);
+        std::cout << "  => Filtered observations: "
+                  << iter_filtered_observations << std::endl;
+        num_changed_observations += iter_filtered_observations;
+
+        const double changed =
+            num_observations == 0
+                ? 0
+                : static_cast<double>(num_changed_observations) /
+                      static_cast<double>(num_observations);
+        std::cout << StringPrintf("  => Changed observations: %.6f", changed)
+                  << std::endl;
+        if (changed < local_options.ba_global_max_refinement_change) {
+          break;
+        }
+      }
+    }
+
+    mapper.EndReconstruction(false);
+    sub_reconstructions[c] = std::move(sub_rec);
+    sub_success[c] = true;
+  };
+
+  // 线程池并行处理子模型
+  ThreadPool thread_pool(num_eff_workers);
+  for (const auto c : cluster_order) {
+    thread_pool.AddTask(ProcessCluster, c);
+  }
+  thread_pool.Wait();
+
+  // 如果有任一线程失败，直接终止
+  if (any_failed.load()) {
+    std::cout << error_msg << "\n";
+    return false;
+  }
+
+  // 合并子模型（参考 hierarchical 的贪心合并策略）
+  std::vector<size_t> merge_indices;
+  merge_indices.reserve(clusters.size());
+  for (const auto c : cluster_order) {
+    if (sub_success[c]) {
+      merge_indices.push_back(c);
+    }
+  }
+  if (merge_indices.empty()) {
+    std::cout << "No valid sub-models were reconstructed.\n";
+    return false;
+  }
+
+  // 尝试两两合并子模型，直至无法合并
+  bool merge_success = true;
+  while (merge_indices.size() > 1 && merge_success) {
+    merge_success = false;
+    for (size_t i = 0; i < merge_indices.size(); ++i) {
+      for (size_t j = 0; j < i; ++j) {
+        auto& rec_i = sub_reconstructions[merge_indices[i]];
+        auto& rec_j = sub_reconstructions[merge_indices[j]];
+        if (rec_i.Merge(rec_j, kMergeMaxReprojError)) {
+          sub_reconstructions[merge_indices[j]] = Reconstruction();
+          merge_indices.erase(merge_indices.begin() + j);
+          merge_success = true;
+          break;
+        }
+      }
+      if (merge_success) {
+        break;
+      }
+    }
+  }
+
+  // 如果还剩多个模型，选取最大的一个作为基准模型
+  size_t base_idx = merge_indices.front();
+  if (merge_indices.size() > 1) {
+    size_t best_idx = merge_indices.front();
+    size_t best_size = sub_reconstructions[best_idx].NumRegImages();
+    for (const auto idx : merge_indices) {
+      const size_t size = sub_reconstructions[idx].NumRegImages();
+      if (size > best_size) {
+        best_idx = idx;
+        best_size = size;
+      }
+    }
+    base_idx = best_idx;
+    std::cout << "WARNING: " << merge_indices.size()
+              << " sub-models remain unmerged; using largest as base.\n";
+  }
+
+  for (size_t idx = 0; idx < sub_reconstructions.size(); ++idx) {
+    if (idx != base_idx) {
+      sub_reconstructions[idx] = Reconstruction();
+    }
+  }
+
+  Reconstruction merged = std::move(sub_reconstructions[base_idx]);
+
+  // 全局优化
+  IncrementalMapper mapper(&database_cache);
+  mapper.BeginReconstruction(&merged);
+
+  // 调整全局ba参数
+  BundleAdjustmentOptions ba_options_global = mapper_options.GlobalBundleAdjustment();
+  ba_options_global.refine_focal_length = true;
+  ba_options_global.refine_principal_point = false;
+  ba_options_global.refine_extra_params = true;
+  ba_options_global.refine_extrinsics = true;
+  BundleAdjustmentOptions ba_options_warmup = ba_options_global;
+  ba_options_warmup.loss_function_type = BundleAdjustmentOptions::LossFunctionType::SOFT_L1;
+  ba_options_warmup.loss_function_scale = 1.0;
+  BundleAdjustmentOptions ba_options_refine = ba_options_global;
+  ba_options_refine.loss_function_type = BundleAdjustmentOptions::LossFunctionType::SOFT_L1;
+  ba_options_refine.loss_function_scale = 0.5;
+
+  BundleAdjustmentConfig ba_config;
+  for (const image_t image_id : merged.RegImageIds()) {
+    ba_config.AddImage(image_id);
+  }
+
+  std::vector<CameraRig> camera_rigs;
+  RigBundleAdjuster::Options rig_ba_options;
+  if (!rig_config_path.empty()) {
+    std::string error;
+    if (!ReadCameraRigConfigFromFile(rig_config_path, merged, &camera_rigs,
+                                     &error)) {
+      std::cout << "Failed to read rig config: " << error << "\n";
+      mapper.EndReconstruction(true);
+      return false;
+    }
+  }
+
+  if (merged.ComputeNumObservations() > 0) {
+    const int kWarmupIters = std::min(5, mapper_options.ba_global_max_refinements);
+    const int kMainIters = std::max(0, mapper_options.ba_global_max_refinements - kWarmupIters);
+
+    for (int i = 0; i < kWarmupIters; ++i) {
+      merged.FilterObservationsWithNegativeDepth();
+      const size_t num_observations = merged.ComputeNumObservations();
+
+      PrintHeading1("Bundle adjustment (warmup)");
+      RigBundleAdjuster bundle_adjuster(ba_options_warmup, rig_ba_options,
+                                        ba_config);
+      if (!bundle_adjuster.Solve(&merged, &camera_rigs)) {
+        std::cout << "ERROR: bundle adjustment failed.\n";
+        mapper.EndReconstruction(true);
+        return false;
+      }
+
+      size_t num_changed_observations = 0;
+      num_changed_observations +=
+          CompleteAndMergeTracks(mapper_options, &mapper);
+      const size_t iter_filtered_observations =
+          mapper.FilterPoints(mapper_filter_loose);
+      std::cout << "  => Filtered observations: "
+                << iter_filtered_observations << std::endl;
+      num_changed_observations += iter_filtered_observations;
+
+      const double changed =
+          num_observations == 0
+              ? 0
+              : static_cast<double>(num_changed_observations) /
+                    static_cast<double>(num_observations);
+      std::cout << StringPrintf("  => Changed observations: %.6f", changed)
+                << std::endl;
+      if (changed < mapper_options.ba_global_max_refinement_change) {
+        break;
+      }
+    }
+
+    for (int i = 0; i < kMainIters; ++i) {
+      merged.FilterObservationsWithNegativeDepth();
+      const size_t num_observations = merged.ComputeNumObservations();
+
+      PrintHeading1("Bundle adjustment (refine)");
+      RigBundleAdjuster bundle_adjuster(ba_options_refine, rig_ba_options,
+                                        ba_config);
+      if (!bundle_adjuster.Solve(&merged, &camera_rigs)) {
+        std::cout << "ERROR: bundle adjustment failed.\n";
+        mapper.EndReconstruction(true);
+        return false;
+      }
+
+      size_t num_changed_observations = 0;
+      num_changed_observations +=
+          CompleteAndMergeTracks(mapper_options, &mapper);
+      const size_t iter_filtered_observations =
+          mapper.FilterPoints(mapper_filter_strict);
+      std::cout << "  => Filtered observations: "
+                << iter_filtered_observations << std::endl;
+      num_changed_observations += iter_filtered_observations;
+
+      const double changed =
+          num_observations == 0
+              ? 0
+              : static_cast<double>(num_changed_observations) /
+                    static_cast<double>(num_observations);
+      std::cout << StringPrintf("  => Changed observations: %.6f", changed)
+                << std::endl;
+      if (changed < mapper_options.ba_global_max_refinement_change) {
+        break;
+      }
+    }
+  }
+
+  const size_t final_filtered =
+      merged.FilterAllPoints3D(kStrictMaxReprojError, kStrictMinTriAngle);
+  if (final_filtered > 0) {
+    std::cout << "  => Filtered observations (strict): " << final_filtered
+              << "\n";
+  }
+  const auto point3D_ids = merged.Point3DIds();
+  size_t removed_tracks = 0;
+  for (const auto point3D_id : point3D_ids) {
+    if (!merged.ExistsPoint3D(point3D_id)) {
+      continue;
+    }
+    if (merged.Point3D(point3D_id).Track().Length() < kMinTrackLength) {
+      merged.DeletePoint3D(point3D_id);
+      removed_tracks += 1;
+    }
+  }
+  if (removed_tracks > 0) {
+    std::cout << "  => Removed short tracks: " << removed_tracks << "\n";
+  }
+
+  const size_t num_filtered_images =
+      mapper.FilterImages(mapper_filter_strict);
+  std::cout << "  => Filtered images: " << num_filtered_images << std::endl;
+
+  mapper.EndReconstruction(false);
+  *reconstruction = std::move(merged);
   return true;
 }
 
