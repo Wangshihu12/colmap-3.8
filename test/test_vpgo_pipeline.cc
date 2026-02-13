@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -30,6 +31,7 @@
 #include "estimators/similarity_transform.h"
 #include "estimators/homography_matrix.h"
 #include "estimators/pose.h"
+#include "estimators/triangulation.h"
 #include "estimators/two_view_geometry.h"
 #include "estimators/utils.h"
 #include "feature/utils.h"
@@ -3326,6 +3328,699 @@ bool ParseArgs(int argc, char** argv, PipelineOptions* options) {
   return true;
 }
 
+struct ObservationKey {
+  image_t image_id = kInvalidImageId;
+  point2D_t point2D_idx = kInvalidPoint2DIdx;
+
+  bool operator==(const ObservationKey& other) const {
+    return image_id == other.image_id && point2D_idx == other.point2D_idx;
+  }
+};
+
+struct ObservationKeyHash {
+  size_t operator()(const ObservationKey& key) const {
+    const size_t h1 = std::hash<image_t>()(key.image_id);
+    const size_t h2 = std::hash<point2D_t>()(key.point2D_idx);
+    return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+  }
+};
+
+struct TrackTriangulationOptions {
+  EstimateTriangulationOptions triangulation;
+  size_t min_inlier_track_length = 3;
+};
+
+struct TrackTriangulationReport {
+  size_t num_triangulated_points = 0;
+  size_t num_added_observations = 0;
+};
+
+struct IterativeStageOptions {
+  std::string name;
+  int max_iterations = 0;
+  bool triangulate_tracks = true; // 是否三角化新的3d点
+  double complete_max_reproj_error = -1.0; // 轨迹补全阈值
+  TrackTriangulationOptions triangulation_options;
+  BundleAdjustmentOptions ba_options;
+  IncrementalMapper::Options filter_options;
+};
+
+/**
+ * [功能描述]：从内点匹配图构建多视图轨迹（track）。
+ *   将所有图像对的内点匹配视为图的边，通过连通分量分析合并为多视图轨迹，
+ *   每个轨迹中同一图像只保留连接度最高的观测点。
+ * @param reconstruction：当前3D重建结果
+ * @param database：特征数据库
+ * @return 多视图轨迹列表
+ */
+std::vector<Track> BuildMultiViewTracksFromInlierGraph(
+    const Reconstruction& reconstruction, Database* database) {
+  std::vector<Track> tracks;
+  if (database == nullptr || reconstruction.NumRegImages() < 2) {
+    return tracks;
+  }
+
+  // 收集所有已注册的图像ID
+  std::unordered_set<image_t> reg_image_ids;
+  reg_image_ids.reserve(reconstruction.NumRegImages());
+  for (const image_t image_id : reconstruction.RegImageIds()) {
+    reg_image_ids.insert(image_id);
+  }
+
+  // 读取所有图像对的两视图几何
+  std::vector<image_pair_t> image_pair_ids;
+  std::vector<TwoViewGeometry> two_view_geometries;
+  database->ReadTwoViewGeometries(&image_pair_ids, &two_view_geometries);
+
+  // ---- 第一阶段：构建观测点的邻接图 ----
+  // 每个节点是一个(image_id, point2D_idx)观测，边连接内点匹配的两个观测
+  std::unordered_map<ObservationKey, size_t, ObservationKeyHash> node_index;
+  node_index.reserve(image_pair_ids.size() * 8);
+  std::vector<ObservationKey> nodes;
+  nodes.reserve(image_pair_ids.size() * 8);
+  std::vector<std::vector<size_t>> adjacency;  // 邻接表
+  adjacency.reserve(image_pair_ids.size() * 8);
+
+  // 查找或创建节点，返回节点索引
+  auto GetOrCreateNode = [&](const ObservationKey& key) -> size_t {
+    const auto it = node_index.find(key);
+    if (it != node_index.end()) {
+      return it->second;
+    }
+    const size_t idx = nodes.size();
+    node_index.emplace(key, idx);
+    nodes.push_back(key);
+    adjacency.emplace_back();
+    return idx;
+  };
+
+  // 遍历所有图像对，将内点匹配添加为图的边
+  size_t num_edges = 0;
+  for (size_t pair_idx = 0; pair_idx < image_pair_ids.size(); ++pair_idx) {
+    image_t image_id1 = kInvalidImageId;
+    image_t image_id2 = kInvalidImageId;
+    Database::PairIdToImagePair(image_pair_ids[pair_idx], &image_id1, &image_id2);
+    // 跳过未注册的图像
+    if (reg_image_ids.count(image_id1) == 0 || reg_image_ids.count(image_id2) == 0) {
+      continue;
+    }
+
+    const TwoViewGeometry& geom = two_view_geometries[pair_idx];
+    if (geom.inlier_matches.empty()) {
+      continue;
+    }
+
+    const Image& image1 = reconstruction.Image(image_id1);
+    const Image& image2 = reconstruction.Image(image_id2);
+    for (const auto& match : geom.inlier_matches) {
+      if (match.point2D_idx1 >= image1.NumPoints2D() ||
+          match.point2D_idx2 >= image2.NumPoints2D()) {
+        continue;
+      }
+
+      const ObservationKey key1{image_id1, match.point2D_idx1};
+      const ObservationKey key2{image_id2, match.point2D_idx2};
+      const size_t idx1 = GetOrCreateNode(key1);
+      const size_t idx2 = GetOrCreateNode(key2);
+      if (idx1 == idx2) {
+        continue;
+      }
+
+      // 双向添加边
+      adjacency[idx1].push_back(idx2);
+      adjacency[idx2].push_back(idx1);
+      num_edges += 1;
+    }
+  }
+
+  // ---- 第二阶段：DFS查找连通分量，每个连通分量对应一条轨迹 ----
+  std::vector<char> visited(nodes.size(), 0);
+  std::vector<size_t> stack;
+  stack.reserve(256);
+  tracks.reserve(nodes.size() / 3 + 1);
+
+  for (size_t node_idx = 0; node_idx < nodes.size(); ++node_idx) {
+    if (visited[node_idx]) {
+      continue;
+    }
+
+    // DFS遍历收集当前连通分量的所有节点
+    stack.clear();
+    stack.push_back(node_idx);
+    visited[node_idx] = 1;
+
+    std::vector<size_t> component_nodes;
+    component_nodes.reserve(16);
+
+    while (!stack.empty()) {
+      const size_t cur = stack.back();
+      stack.pop_back();
+      component_nodes.push_back(cur);
+
+      for (const size_t nbr : adjacency[cur]) {
+        if (visited[nbr]) {
+          continue;
+        }
+        visited[nbr] = 1;
+        stack.push_back(nbr);
+      }
+    }
+
+    // 同一图像中只保留连接度最高的观测点（去重）
+    std::unordered_map<image_t, size_t> best_node_by_image;
+    best_node_by_image.reserve(component_nodes.size());
+    for (const size_t idx : component_nodes) {
+      const ObservationKey& obs = nodes[idx];
+      auto it = best_node_by_image.find(obs.image_id);
+      if (it == best_node_by_image.end() ||
+          adjacency[idx].size() > adjacency[it->second].size()) {
+        best_node_by_image[obs.image_id] = idx;
+      }
+    }
+
+    // 轨迹至少需要2个不同图像的观测
+    if (best_node_by_image.size() < 2) {
+      continue;
+    }
+
+    // 按(image_id, point2D_idx)排序，保证轨迹元素顺序一致
+    std::vector<size_t> selected_nodes;
+    selected_nodes.reserve(best_node_by_image.size());
+    for (const auto& kv : best_node_by_image) {
+      selected_nodes.push_back(kv.second);
+    }
+    std::sort(selected_nodes.begin(), selected_nodes.end(),
+              [&](const size_t lhs, const size_t rhs) {
+                const ObservationKey& a = nodes[lhs];
+                const ObservationKey& b = nodes[rhs];
+                if (a.image_id != b.image_id) {
+                  return a.image_id < b.image_id;
+                }
+                return a.point2D_idx < b.point2D_idx;
+              });
+
+    // 构建轨迹
+    Track track;
+    track.Reserve(selected_nodes.size());
+    for (const size_t idx : selected_nodes) {
+      const ObservationKey& obs = nodes[idx];
+      track.AddElement(obs.image_id, obs.point2D_idx);
+    }
+
+    if (track.Length() >= 2) {
+      tracks.push_back(std::move(track));
+    }
+  }
+
+  std::cout << "Built multi-view tracks from inlier graph: nodes=" << nodes.size()
+            << " edges=" << num_edges << " tracks=" << tracks.size() << "\n";
+  return tracks;
+}
+
+struct TrackTriangulationCandidate {
+  bool success = false;
+  Eigen::Vector3d xyz = Eigen::Vector3d::Zero();
+  std::vector<TrackElement> inlier_elements;
+};
+
+TrackTriangulationCandidate EstimateTrackTriangulationCandidate(
+    const Track& input_track, const TrackTriangulationOptions& options,
+    const Reconstruction& reconstruction) {
+  TrackTriangulationCandidate candidate;
+  if (input_track.Length() < 2) {
+    return candidate;
+  }
+
+  // ---- 第一阶段：收集有效观测的2D/3D数据（只读）----
+  std::vector<TriangulationEstimator::PointData> point_data;
+  std::vector<TriangulationEstimator::PoseData> pose_data;
+  std::vector<TrackElement> candidate_elements;
+  point_data.reserve(input_track.Length());
+  pose_data.reserve(input_track.Length());
+  candidate_elements.reserve(input_track.Length());
+
+  std::unordered_set<image_t> used_images;
+  used_images.reserve(input_track.Length());
+
+  for (const auto& track_el : input_track.Elements()) {
+    if (!reconstruction.ExistsImage(track_el.image_id)) {
+      continue;
+    }
+    const Image& image = reconstruction.Image(track_el.image_id);
+    if (!image.IsRegistered()) {
+      continue;
+    }
+    if (track_el.point2D_idx >= image.NumPoints2D()) {
+      continue;
+    }
+    if (image.Point2D(track_el.point2D_idx).HasPoint3D()) {
+      continue;
+    }
+    if (!used_images.insert(track_el.image_id).second) {
+      continue;
+    }
+
+    const Camera& camera = reconstruction.Camera(image.CameraId());
+    const Eigen::Vector2d point = image.Point2D(track_el.point2D_idx).XY();
+    point_data.emplace_back(point, camera.ImageToWorld(point));
+    pose_data.emplace_back(image.ProjectionMatrix(), image.ProjectionCenter(),
+                           &camera);
+    candidate_elements.push_back(track_el);
+  }
+
+  if (point_data.size() < 2) {
+    return candidate;
+  }
+
+  // 对短轨迹使用穷举采样，和增量三角化逻辑对齐。
+  EstimateTriangulationOptions tri_options = options.triangulation;
+  const size_t kExhaustiveSamplingThreshold = 15;
+  if (point_data.size() <= kExhaustiveSamplingThreshold) {
+    tri_options.ransac_options.min_num_trials = NChooseK(point_data.size(), 2);
+  }
+
+  // ---- 第二阶段：RANSAC鲁棒三角化 ----
+  std::vector<char> inlier_mask;
+  Eigen::Vector3d xyz = Eigen::Vector3d::Zero();
+  if (!EstimateTriangulation(tri_options, point_data, pose_data, &inlier_mask,
+                             &xyz)) {
+    return candidate;
+  }
+
+  candidate.inlier_elements.reserve(inlier_mask.size());
+  for (size_t i = 0; i < inlier_mask.size(); ++i) {
+    if (inlier_mask[i]) {
+      candidate.inlier_elements.push_back(candidate_elements[i]);
+    }
+  }
+  if (candidate.inlier_elements.size() <
+      std::max<size_t>(2, options.min_inlier_track_length)) {
+    candidate.inlier_elements.clear();
+    return candidate;
+  }
+
+  candidate.success = true;
+  candidate.xyz = xyz;
+  return candidate;
+}
+
+bool CommitTrackTriangulationCandidate(
+    const TrackTriangulationCandidate& candidate,
+    const TrackTriangulationOptions& options, Reconstruction* reconstruction,
+    size_t* num_added_observations) {
+  if (reconstruction == nullptr || !candidate.success) {
+    return false;
+  }
+  if (num_added_observations != nullptr) {
+    *num_added_observations = 0;
+  }
+
+  // ---- 第三阶段：提交写回（串行）----
+  Track inlier_track;
+  inlier_track.Reserve(candidate.inlier_elements.size());
+  std::unordered_set<image_t> used_images;
+  used_images.reserve(candidate.inlier_elements.size());
+  for (const auto& track_el : candidate.inlier_elements) {
+    if (!reconstruction->ExistsImage(track_el.image_id)) {
+      continue;
+    }
+    const Image& image = reconstruction->Image(track_el.image_id);
+    if (track_el.point2D_idx >= image.NumPoints2D()) {
+      continue;
+    }
+    if (image.Point2D(track_el.point2D_idx).HasPoint3D()) {
+      continue;
+    }
+    if (!used_images.insert(track_el.image_id).second) {
+      continue;
+    }
+    inlier_track.AddElement(track_el);
+  }
+
+  const size_t min_track_length = std::max<size_t>(2, options.min_inlier_track_length);
+  if (inlier_track.Length() < min_track_length) {
+    return false;
+  }
+
+  const size_t added = inlier_track.Length();
+  reconstruction->AddPoint3D(candidate.xyz, std::move(inlier_track));
+  if (num_added_observations != nullptr) {
+    *num_added_observations = added;
+  }
+  return true;
+}
+
+/**
+ * [功能描述]：使用RANSAC对单条轨迹进行三角化，将估计的3D点添加到重建中。
+ *   该函数内部使用“估计候选(只读)+提交写回(串行)”模式，便于与并行批处理复用。
+ */
+bool TriangulateSingleTrackRANSAC(const Track& input_track,
+                                  const TrackTriangulationOptions& options,
+                                  Reconstruction* reconstruction,
+                                  size_t* num_added_observations) {
+  if (reconstruction == nullptr) {
+    return false;
+  }
+  const auto candidate = EstimateTrackTriangulationCandidate(input_track, options, *reconstruction);
+  return CommitTrackTriangulationCandidate(candidate, options, reconstruction,
+                                           num_added_observations);
+}
+
+/**
+ * [功能描述]：批量对多条轨迹执行RANSAC三角化，统计成功三角化的点数和观测数。
+ * @param tracks：多视图轨迹列表
+ * @param options：三角化选项
+ * @param reconstruction：3D重建（输入输出）
+ * @return 三角化报告（成功点数、添加的观测数）
+ */
+TrackTriangulationReport TriangulateTracksRANSAC(
+    const std::vector<Track>& tracks, const TrackTriangulationOptions& options,
+    Reconstruction* reconstruction) {
+  TrackTriangulationReport report;
+  if (reconstruction == nullptr) {
+    return report;
+  }
+  if (tracks.empty()) {
+    return report;
+  }
+
+  const int num_eff_threads =
+      GetEffectiveNumThreads(ThreadPool::kMaxNumThreads);
+  const size_t num_workers =
+      std::max<size_t>(1, std::min<size_t>(tracks.size(), num_eff_threads));
+
+  // 阶段1：并行估计每条轨迹的三角化候选（只读重建，线程安全）
+  std::vector<TrackTriangulationCandidate> candidates(tracks.size());
+  std::atomic<size_t> next_idx(0);
+  ThreadPool thread_pool(static_cast<int>(num_workers));
+  for (size_t worker = 0; worker < num_workers; ++worker) {
+    thread_pool.AddTask([&]() {
+      while (true) {
+        const size_t idx = next_idx.fetch_add(1);
+        if (idx >= tracks.size()) {
+          break;
+        }
+        candidates[idx] = EstimateTrackTriangulationCandidate(
+            tracks[idx], options, *reconstruction);
+      }
+    });
+  }
+  thread_pool.Wait();
+
+  // 阶段2：串行提交，解决观测冲突并写回重建（AddPoint3D非线程安全）
+  size_t num_estimated_candidates = 0;
+  for (const auto& candidate : candidates) {
+    if (!candidate.success) {
+      continue;
+    }
+    num_estimated_candidates += 1;
+    size_t num_added_observations = 0;
+    if (!CommitTrackTriangulationCandidate(
+            candidate, options, reconstruction, &num_added_observations)) {
+      continue;
+    }
+    report.num_triangulated_points += 1;
+    report.num_added_observations += num_added_observations;
+  }
+
+  return report;
+}
+
+/**
+ * [功能描述]：执行迭代式三角化+BA优化阶段。
+ *   每轮迭代：三角化 -> BA优化 -> 补全/合并轨迹 -> 过滤异常点，
+ *   当观测变化率低于阈值时提前终止。
+ * @param stage_options：阶段配置（名称、最大迭代次数、三角化/BA/过滤参数）
+ * @param tracks：多视图轨迹列表
+ * @param mapper_options：增量建图选项
+ * @param mapper：增量建图器
+ * @param reconstruction：3D重建（输入输出）
+ * @param camera_rigs：相机rig列表
+ * @param rig_ba_options：rig BA选项
+ * @param ba_config：BA配置（包含参与优化的图像列表）
+ * @return 成功返回true，BA失败返回false
+ */
+bool RunIterativeStage(const IterativeStageOptions& stage_options,
+                       const std::vector<Track>& tracks,
+                       const IncrementalMapperOptions& mapper_options,
+                       IncrementalMapper* mapper, Reconstruction* reconstruction,
+                       std::vector<CameraRig>* camera_rigs,
+                       const RigBundleAdjuster::Options& rig_ba_options,
+                       const BundleAdjustmentConfig& ba_config) {
+  if (mapper == nullptr || reconstruction == nullptr || camera_rigs == nullptr) {
+    return false;
+  }
+  if (stage_options.max_iterations <= 0) {
+    return true;
+  }
+
+  PrintHeading1(stage_options.name);
+  for (int iter = 0; iter < stage_options.max_iterations; ++iter) {
+    std::cout << "[" << stage_options.name << "] Iteration " << (iter + 1)
+              << "/" << stage_options.max_iterations << "\n";
+
+    // RANSAC三角化新的3D点
+    if (stage_options.triangulate_tracks) {
+      const auto tri_report = TriangulateTracksRANSAC(
+          tracks, stage_options.triangulation_options, reconstruction);
+      std::cout << "  => Triangulated points: " << tri_report.num_triangulated_points
+                << ", added observations: " << tri_report.num_added_observations
+                << "\n";
+    }
+            
+    // 过滤负深度观测，记录当前观测数量
+    reconstruction->FilterObservationsWithNegativeDepth();
+    const size_t num_observations_before =
+        reconstruction->ComputeNumObservations();
+
+    // 按阶段参数补全和合并轨迹
+    auto tri_options = mapper_options.Triangulation();
+    if (stage_options.complete_max_reproj_error > 0.0) {
+      tri_options.complete_max_reproj_error =
+          stage_options.complete_max_reproj_error;
+    }
+    const size_t num_completed = mapper->CompleteTracks(tri_options);
+    std::cout << "  => Completed observations: " << num_completed << std::endl;
+    const size_t num_merged = mapper->MergeTracks(tri_options);
+    std::cout << "  => Merged observations: " << num_merged << std::endl;
+    const size_t num_completed_merged = num_completed + num_merged;
+
+    if (reconstruction->ComputeNumObservations() == 0) {
+      std::cout << "  => No observations. Skip BA in this iteration.\n";
+      continue;
+    }
+
+    // 执行Rig BA优化
+    RigBundleAdjuster bundle_adjuster(stage_options.ba_options, rig_ba_options,
+                                      ba_config);
+    if (!bundle_adjuster.Solve(reconstruction, camera_rigs)) {
+      std::cout << "ERROR: bundle adjustment failed in stage "
+                << stage_options.name << ".\n";
+      return false;
+    }
+
+    // // 补全和合并轨迹
+    // const size_t num_completed_merged =
+    //     CompleteAndMergeTracks(mapper_options, mapper);
+
+    // 过滤异常观测（负深度 + 自定义过滤条件）
+    reconstruction->FilterObservationsWithNegativeDepth();
+    const size_t num_filtered = mapper->FilterPoints(stage_options.filter_options);
+    std::cout << "  => Filtered observations: " << num_filtered << "\n";
+
+    // 计算观测变化率，低于阈值则提前终止
+    const size_t num_changed = num_completed_merged + num_filtered;
+    const double changed =
+        num_observations_before == 0
+            ? 0.0
+            : static_cast<double>(num_changed) /
+                  static_cast<double>(num_observations_before);
+    std::cout << StringPrintf("  => Changed observations: %.6f", changed)
+              << std::endl;
+    if (changed < mapper_options.ba_global_max_refinement_change) {
+      break;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * [功能描述]：执行两阶段迭代三角化与BA优化。
+ *   阶段1（warmup）：宽松阈值 + 鲁棒损失（Soft-L1），快速收敛并清洗外点。
+ *   阶段2（refine）：严格阈值 + 非鲁棒损失（Trivial），获取高精度结果。
+ *   最后进行严格过滤和短轨迹清理。
+ * @param reconstruction：3D重建（输入输出）
+ * @param database：特征数据库
+ * @param rig_config_path：相机rig配置路径（可为空）
+ * @return 成功返回true，失败返回false
+ */
+bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
+                                      Database* database,
+                                      const std::string& rig_config_path) {
+  if (reconstruction == nullptr || database == nullptr) {
+    return false;
+  }
+
+  // 清除已有的3D点，从头开始三角化
+  if (reconstruction->NumPoints3D() > 0) {
+    const auto point3D_ids = reconstruction->Point3DIds();
+    for (const auto point3D_id : point3D_ids) {
+      reconstruction->DeletePoint3D(point3D_id);
+    }
+    std::cout << "Cleared existing 3D points: " << point3D_ids.size() << "\n";
+  }
+
+  if (reconstruction->NumRegImages() < 2) {
+    std::cout << "Need at least two registered images for triangulation.\n";
+    return false;
+  }
+
+  // ---- 准备工作：构建多视图轨迹 ----
+  const std::vector<Track> tracks = BuildMultiViewTracksFromInlierGraph(*reconstruction, database);
+  if (tracks.empty()) {
+    std::cout << "No valid multi-view tracks were built.\n";
+    return false;
+  }
+
+  // 初始化建图器和BA配置
+  IncrementalMapperOptions mapper_options;
+  mapper_options.ba_refine_focal_length = true;
+  mapper_options.ba_refine_principal_point = false;
+  mapper_options.ba_refine_extra_params = true;
+  mapper_options.ba_global_max_refinements = 10;
+  mapper_options.ba_global_max_num_iterations = 50;
+
+  DatabaseCache database_cache;
+  const size_t min_num_matches =
+      static_cast<size_t>(mapper_options.min_num_matches);
+  database_cache.Load(*database, min_num_matches,
+                      mapper_options.ignore_watermarks,
+                      mapper_options.image_names);
+
+  IncrementalMapper mapper(&database_cache);
+  mapper.BeginReconstruction(reconstruction);
+
+  // 将所有已注册图像加入BA优化
+  BundleAdjustmentConfig ba_config;
+  for (const image_t image_id : reconstruction->RegImageIds()) {
+    ba_config.AddImage(image_id);
+  }
+
+  // 加载rig配置（可选）
+  std::vector<CameraRig> camera_rigs;
+  RigBundleAdjuster::Options rig_ba_options;
+  if (!rig_config_path.empty()) {
+    std::string error;
+    if (!ReadCameraRigConfigFromFile(rig_config_path, *reconstruction,
+                                     &camera_rigs, &error)) {
+      std::cout << "Failed to read rig config: " << error << "\n";
+      mapper.EndReconstruction(true);
+      return false;
+    }
+  }
+
+  // ---- Stage 1: warmup（宽松阈值 + Soft-L1鲁棒损失） ----
+  IterativeStageOptions stage1;
+  stage1.name = "Iterative triangulation + BA (warmup)";
+  stage1.max_iterations = std::min(5, mapper_options.ba_global_max_refinements);
+  stage1.triangulate_tracks = true; // 第一阶段三角化新的3D点
+  stage1.triangulation_options.min_inlier_track_length = 3;
+  stage1.triangulation_options.triangulation.min_tri_angle = DegToRad(1.5);
+  stage1.triangulation_options.triangulation.residual_type =
+      TriangulationEstimator::ResidualType::REPROJECTION_ERROR;
+  stage1.triangulation_options.triangulation.ransac_options.max_error = 4.0;   // 宽松重投影误差阈值
+  stage1.triangulation_options.triangulation.ransac_options.confidence = 0.9999;
+  stage1.triangulation_options.triangulation.ransac_options.min_inlier_ratio = 0.02;
+  stage1.triangulation_options.triangulation.ransac_options.max_num_trials = 10000;
+  stage1.filter_options = mapper_options.Mapper();
+  stage1.filter_options.filter_max_reproj_error = 4.0;   // 宽松过滤阈值
+  stage1.filter_options.filter_min_tri_angle = 1.5;
+  stage1.complete_max_reproj_error = 4.0;                // 宽松补全阈值
+  stage1.ba_options = mapper_options.GlobalBundleAdjustment();
+  stage1.ba_options.refine_focal_length = true;
+  stage1.ba_options.refine_principal_point = false;
+  stage1.ba_options.refine_extra_params = true;
+  stage1.ba_options.refine_extrinsics = true;
+  stage1.ba_options.loss_function_type =
+      BundleAdjustmentOptions::LossFunctionType::SOFT_L1;  // 鲁棒损失
+  stage1.ba_options.loss_function_scale = 1.0;
+
+  // ---- Stage 2: refine（严格阈值 + Trivial非鲁棒损失） ----
+  IterativeStageOptions stage2;
+  stage2.name = "Iterative triangulation + BA (refine)";
+  stage2.max_iterations = std::max(
+      0, mapper_options.ba_global_max_refinements - stage1.max_iterations);
+  stage2.triangulate_tracks = false;
+  stage2.triangulation_options.min_inlier_track_length = 3;
+  stage2.triangulation_options.triangulation.min_tri_angle = DegToRad(1.5);
+  stage2.triangulation_options.triangulation.residual_type =
+      TriangulationEstimator::ResidualType::REPROJECTION_ERROR;
+  stage2.triangulation_options.triangulation.ransac_options.max_error = 3.0;   // 严格重投影误差阈值
+  stage2.triangulation_options.triangulation.ransac_options.confidence = 0.9999;
+  stage2.triangulation_options.triangulation.ransac_options.min_inlier_ratio =
+      0.02;
+  stage2.triangulation_options.triangulation.ransac_options.max_num_trials =
+      10000;
+  stage2.filter_options = mapper_options.Mapper();
+  stage2.filter_options.filter_max_reproj_error = 3.0;   // 严格过滤阈值
+  stage2.filter_options.filter_min_tri_angle = 2.5;
+  stage2.complete_max_reproj_error = 3.0;                // 严格补全阈值
+  stage2.ba_options = mapper_options.GlobalBundleAdjustment();
+  stage2.ba_options.refine_focal_length = true;
+  stage2.ba_options.refine_principal_point = false;
+  stage2.ba_options.refine_extra_params = true;
+  stage2.ba_options.refine_extrinsics = true;
+  stage2.ba_options.loss_function_type =
+      BundleAdjustmentOptions::LossFunctionType::TRIVIAL;  // 非鲁棒损失
+
+  // 依次执行两个阶段
+  if (!RunIterativeStage(stage1, tracks, mapper_options, &mapper, reconstruction,
+                         &camera_rigs, rig_ba_options, ba_config)) {
+    mapper.EndReconstruction(true);
+    return false;
+  }
+  if (!RunIterativeStage(stage2, tracks, mapper_options, &mapper, reconstruction,
+                         &camera_rigs, rig_ba_options, ba_config)) {
+    mapper.EndReconstruction(true);
+    return false;
+  }
+
+  // ---- 最终清理：严格过滤 + 删除短轨迹 ----
+  const double kStrictMaxReprojError = 3.0;
+  const double kStrictMinTriAngle = 2.5;
+  const size_t kMinTrackLength = 3;
+  const size_t final_filtered =
+      reconstruction->FilterAllPoints3D(kStrictMaxReprojError, kStrictMinTriAngle);
+  if (final_filtered > 0) {
+    std::cout << "  => Filtered observations (strict): " << final_filtered
+              << "\n";
+  }
+
+  // 删除观测数不足的短轨迹
+  const auto point3D_ids = reconstruction->Point3DIds();
+  size_t removed_tracks = 0;
+  for (const auto point3D_id : point3D_ids) {
+    if (!reconstruction->ExistsPoint3D(point3D_id)) {
+      continue;
+    }
+    if (reconstruction->Point3D(point3D_id).Track().Length() < kMinTrackLength) {
+      reconstruction->DeletePoint3D(point3D_id);
+      removed_tracks += 1;
+    }
+  }
+  if (removed_tracks > 0) {
+    std::cout << "  => Removed short tracks: " << removed_tracks << "\n";
+  }
+
+  // 过滤质量不佳的图像
+  const size_t num_filtered_images = mapper.FilterImages(stage2.filter_options);
+  std::cout << "  => Filtered images: " << num_filtered_images << "\n";
+
+  mapper.EndReconstruction(false);
+  return true;
+}
+
 bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
                             const std::string& rig_config_path) {
   if (reconstruction == nullptr || database == nullptr) {
@@ -3351,12 +4046,12 @@ bool TriangulateAndOptimize(Reconstruction* reconstruction, Database* database,
   mapper_options.ba_refine_focal_length = true;
   mapper_options.ba_refine_principal_point = false;
   mapper_options.ba_refine_extra_params = true;
-  mapper_options.ba_global_max_refinements = 20; // 调整全局优化迭代次数
+  mapper_options.ba_global_max_refinements = 10; // 调整全局优化迭代次数
   mapper_options.ba_global_max_num_iterations = 50;
   IncrementalMapper::Options mapper_filter_options =
       mapper_options.Mapper();
-  mapper_filter_options.filter_max_reproj_error = 4.0;
-  mapper_filter_options.filter_min_tri_angle = 1.5;
+  mapper_filter_options.filter_max_reproj_error = 3.0;
+  mapper_filter_options.filter_min_tri_angle = 2.5;
   const double kStrictMaxReprojError = 3.0; // 严格的重投影误差阈值
   const double kStrictMinTriAngle = 2.5;    // 严格的最小三角化角度阈值（度）
   const size_t kMinTrackLength = 3;         // 最短轨迹长度阈值
@@ -4290,8 +4985,8 @@ int main(int argc, char** argv) {
   }
 
   // ========== 9. 三角化与迭代优化 ==========
-  if (!TriangulateAndOptimize(&reconstruction, &database,
-                              options.rig_config_path)) {
+  if (!TriangulateAndOptimizePaperStyle(&reconstruction, &database,
+                                        options.rig_config_path)) {
     return -1;
   }
 
