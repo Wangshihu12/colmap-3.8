@@ -44,6 +44,146 @@
 
 using namespace colmap;
 
+enum DistributionType { DISTRIBUTE_BY_NUM = 0, DISTRIBUTE_BY_ERROR = 1 };
+inline std::vector<std::vector<Point2D>> Distribute(
+    const std::vector<Point2D>& lfs) {
+  std::vector<std::vector<Point2D>> lists(4);
+  if (!lfs.empty()) {
+    double minx, miny, maxx, maxy;
+    minx = miny = std::numeric_limits<double>::max();
+    maxx = maxy = -std::numeric_limits<double>::max();
+    for (const auto& f : lfs) {
+      if (f.X() < minx) {
+        minx = f.X();
+      }
+      if (f.X() > maxx) {
+        maxx = f.X();
+      }
+      if (f.Y() < miny) {
+        miny = f.Y();
+      }
+      if (f.Y() > maxy) {
+        maxy = f.Y();
+      }
+    }
+    double midx = (maxx + minx) / 2, midy = (maxy + miny) / 2;
+    for (const auto& f : lfs) {
+      double x = f.X(), y = f.Y();
+      if (x >= minx && x < midx && y >= miny && y < midy) {
+        lists[0].push_back(f);
+      }
+      if (x >= midx && x <= maxx && y >= miny && y < midy) {
+        lists[1].push_back(f);
+      }
+      if (x >= midx && x <= maxx && y >= midy && y <= maxy) {
+        lists[2].push_back(f);
+      }
+      if (x >= minx && x < midx && y >= midy && y <= maxy) {
+        lists[3].push_back(f);
+      }
+    }
+  }
+  return lists;
+}
+
+
+inline std::vector<point3D_t> DistributeLandmarksImpl(
+    Reconstruction& reconstruction, std::vector<Point2D> keyPoints,
+    DistributionType type, int minNodeCount, int maxSplitCount = 16) {
+  std::vector<std::vector<Point2D>> lists;
+  lists.push_back(keyPoints);
+  for (size_t iter = 0;
+       iter < size_t(maxSplitCount) && lists.size() < size_t(minNodeCount);
+       ++iter) {
+    std::vector<std::vector<Point2D>> tmpLists;
+    for (size_t i = 0; i < lists.size(); ++i) {
+      auto tmp = Distribute(lists[i]);
+      for (const auto& lfs : tmp) {
+        if (!lfs.empty()) {
+          tmpLists.push_back(lfs);
+        }
+      }
+    }
+    lists.swap(tmpLists);
+  }
+  std::vector<point3D_t> validLandmarkIdx;
+  for (const auto& lfs : lists) {
+    size_t maxOb = 0;
+    float min_err = std::numeric_limits<float>::max();
+    point3D_t max_idx = lfs[0].Point3DId();
+    for (const auto& lf : lfs) {
+      size_t track_length =
+          reconstruction.Point3D(lf.Point3DId()).Track().Length();
+      float err = std::numeric_limits<float>::max();
+      if (reconstruction.Point3D(lf.Point3DId()).HasError())
+        err = reconstruction.Point3D(lf.Point3DId()).Error();
+      if (type == DistributionType::DISTRIBUTE_BY_NUM) {
+        if (track_length > maxOb) {
+          max_idx = lf.Point3DId();
+          maxOb = track_length;
+        }
+      } else if (type == DistributionType::DISTRIBUTE_BY_ERROR) {
+        if (err < min_err) {
+          max_idx = lf.Point3DId();
+          min_err = err;
+        }
+      }
+    }
+    validLandmarkIdx.push_back(max_idx);
+  }
+  return validLandmarkIdx;
+}
+
+
+inline bool DistributeLandmarks(
+    Reconstruction& reconstruction, int average_num,
+    std::map<std::string, int> map_map_featunum = {},
+    DistributionType type = DISTRIBUTE_BY_NUM, bool remove_tracks = true) {
+  uint32_t remove_num = 0;
+  for (point3D_t point3D_id : reconstruction.Point3DIds()) {
+    Point3D& point3D = reconstruction.Point3D(point3D_id);
+  }
+  std::set<point3D_t> validLandmarkIds;
+  for (const image_t image_id : reconstruction.RegImageIds()) {
+    Image& image = reconstruction.Image(image_id);
+    std::vector<Point2D> keyPoints;
+    for (const Point2D& point2D : image.Points2D()) {
+      if (!point2D.HasPoint3D()) continue;
+      keyPoints.push_back(point2D);
+    }
+
+    auto image_name = image.Name();
+    //auto image_prefix_name = GetPathPrefixName(image_name);
+    // if (!map_map_featunum.empty() &&
+    //     map_map_featunum.count(image_prefix_name) > 0) {
+    //   average_num = map_map_featunum.at(image_prefix_name);
+    // }
+    auto validIdx =
+        DistributeLandmarksImpl(reconstruction, keyPoints, type, average_num);
+    for (auto id : validIdx) {
+      validLandmarkIds.insert(id);
+    }
+  }
+  std::cout << "MMMMMMMMMMMMMMMMMM[Point3D before]"
+            << reconstruction.Point3DIds().size() << std::endl;
+  for (point3D_t point3D_id : reconstruction.Point3DIds()) {
+    if (validLandmarkIds.find(point3D_id) == validLandmarkIds.end()) {
+      if (remove_tracks)
+        reconstruction.DeletePoint3D(point3D_id);
+      else {
+        Point3D& point3D = reconstruction.Point3D(point3D_id);
+        remove_num++;
+      }
+    }
+  }
+  std::cout << "MMMMMMMMMMMMMMMMMM[Point3D  after]"
+            << reconstruction.Point3DIds().size() << " - " << remove_num
+            << std::endl;
+  return true;
+}
+
+
+
 namespace {
 
 struct SE3RelativePoseCost {
@@ -3798,6 +3938,7 @@ bool RunIterativeStage(const IterativeStageOptions& stage_options,
     if (stage_options.complete_max_reproj_error > 0.0) {
       tri_options.complete_max_reproj_error =
           stage_options.complete_max_reproj_error;
+      tri_options.merge_max_reproj_error = stage_options.complete_max_reproj_error;
     }
     const size_t num_completed = mapper->CompleteTracks(tri_options);
     std::cout << "  => Completed observations: " << num_completed << std::endl;
@@ -3811,6 +3952,7 @@ bool RunIterativeStage(const IterativeStageOptions& stage_options,
     }
 
     // 执行Rig BA优化
+    DistributeLandmarks(*reconstruction, 128);
     RigBundleAdjuster bundle_adjuster(stage_options.ba_options, rig_ba_options,
                                       ba_config);
     if (!bundle_adjuster.Solve(reconstruction, camera_rigs)) {
@@ -3826,6 +3968,9 @@ bool RunIterativeStage(const IterativeStageOptions& stage_options,
     // 过滤异常观测（负深度 + 自定义过滤条件）
     reconstruction->FilterObservationsWithNegativeDepth();
     const size_t num_filtered = mapper->FilterPoints(stage_options.filter_options);
+    std::cout << "  => Number retriangle : "
+              << mapper->Retriangulate(tri_options) << std::endl;
+
     std::cout << "  => Filtered observations: " << num_filtered << "\n";
 
     // 计算观测变化率，低于阈值则提前终止
@@ -3885,11 +4030,11 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
 
   // 初始化建图器和BA配置
   IncrementalMapperOptions mapper_options;
-  mapper_options.ba_refine_focal_length = true;
-  mapper_options.ba_refine_principal_point = false;
-  mapper_options.ba_refine_extra_params = true;
-  mapper_options.ba_global_max_refinements = 10;
-  mapper_options.ba_global_max_num_iterations = 50;
+  // mapper_options.ba_refine_focal_length = true;
+  // mapper_options.ba_refine_principal_point = false;
+  // mapper_options.ba_refine_extra_params = true;
+  // mapper_options.ba_global_max_refinements = 10;
+  // mapper_options.ba_global_max_num_iterations = 50;
 
   DatabaseCache database_cache;
   const size_t min_num_matches =
@@ -3922,57 +4067,71 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
 
   // ---- Stage 1: warmup（宽松阈值 + Soft-L1鲁棒损失） ----
   IterativeStageOptions stage1;
+  mapper_options.ba_refine_focal_length = false;
+  mapper_options.ba_refine_principal_point = false;
+  mapper_options.ba_refine_extra_params = false;
+  mapper_options.ba_global_max_refinements = 2;
+  mapper_options.ba_global_max_num_iterations = 50;
+  double tri_max_project_error = 18.0;
+  double filter_max_reproj_error = 18.0;
   stage1.name = "Iterative triangulation + BA (warmup)";
-  stage1.max_iterations = std::min(5, mapper_options.ba_global_max_refinements);
+  stage1.max_iterations = std::min(2, mapper_options.ba_global_max_refinements);
   stage1.triangulate_tracks = true; // 第一阶段三角化新的3D点
   stage1.triangulation_options.min_inlier_track_length = 3;
-  stage1.triangulation_options.triangulation.min_tri_angle = DegToRad(1.5);
+  stage1.triangulation_options.triangulation.min_tri_angle = DegToRad(2.0);
   stage1.triangulation_options.triangulation.residual_type =
       TriangulationEstimator::ResidualType::REPROJECTION_ERROR;
-  stage1.triangulation_options.triangulation.ransac_options.max_error = 4.0;   // 宽松重投影误差阈值
+  stage1.triangulation_options.triangulation.ransac_options.max_error = tri_max_project_error;   // 宽松重投影误差阈值
   stage1.triangulation_options.triangulation.ransac_options.confidence = 0.9999;
   stage1.triangulation_options.triangulation.ransac_options.min_inlier_ratio = 0.02;
   stage1.triangulation_options.triangulation.ransac_options.max_num_trials = 10000;
   stage1.filter_options = mapper_options.Mapper();
-  stage1.filter_options.filter_max_reproj_error = 4.0;   // 宽松过滤阈值
-  stage1.filter_options.filter_min_tri_angle = 1.5;
-  stage1.complete_max_reproj_error = 4.0;                // 宽松补全阈值
+  stage1.filter_options.filter_max_reproj_error = filter_max_reproj_error;   // 宽松过滤阈值
+  stage1.filter_options.filter_min_tri_angle = 2.0;
+  stage1.complete_max_reproj_error = tri_max_project_error;                // 宽松补全阈值
   stage1.ba_options = mapper_options.GlobalBundleAdjustment();
-  stage1.ba_options.refine_focal_length = true;
+  stage1.ba_options.refine_focal_length = false;
   stage1.ba_options.refine_principal_point = false;
-  stage1.ba_options.refine_extra_params = true;
+  stage1.ba_options.refine_extra_params = false;
   stage1.ba_options.refine_extrinsics = true;
   stage1.ba_options.loss_function_type =
-      BundleAdjustmentOptions::LossFunctionType::SOFT_L1;  // 鲁棒损失
-  stage1.ba_options.loss_function_scale = 1.0;
+      BundleAdjustmentOptions::LossFunctionType::HUBER;  // 鲁棒损失
+  //stage1.ba_options.solver_options.function_tolerance = 1e-4; // 放宽收敛条件，快速迭代
+  stage1.ba_options.loss_function_scale = filter_max_reproj_error;
 
   // ---- Stage 2: refine（严格阈值 + Trivial非鲁棒损失） ----
   IterativeStageOptions stage2;
+  mapper_options.ba_refine_focal_length = true;
+  mapper_options.ba_refine_principal_point = false;
+  mapper_options.ba_refine_extra_params = true;
+  tri_max_project_error = 10.0;
+  filter_max_reproj_error = 4.0;
   stage2.name = "Iterative triangulation + BA (refine)";
-  stage2.max_iterations = std::max(
-      0, mapper_options.ba_global_max_refinements - stage1.max_iterations);
-  stage2.triangulate_tracks = false;
+  stage2.max_iterations = 2;
+  stage2.triangulate_tracks = true;
   stage2.triangulation_options.min_inlier_track_length = 3;
-  stage2.triangulation_options.triangulation.min_tri_angle = DegToRad(1.5);
+  stage2.triangulation_options.triangulation.min_tri_angle = DegToRad(2.0);
   stage2.triangulation_options.triangulation.residual_type =
       TriangulationEstimator::ResidualType::REPROJECTION_ERROR;
-  stage2.triangulation_options.triangulation.ransac_options.max_error = 3.0;   // 严格重投影误差阈值
+  stage2.triangulation_options.triangulation.ransac_options.max_error = tri_max_project_error;   // 严格重投影误差阈值
   stage2.triangulation_options.triangulation.ransac_options.confidence = 0.9999;
   stage2.triangulation_options.triangulation.ransac_options.min_inlier_ratio =
       0.02;
   stage2.triangulation_options.triangulation.ransac_options.max_num_trials =
       10000;
   stage2.filter_options = mapper_options.Mapper();
-  stage2.filter_options.filter_max_reproj_error = 3.0;   // 严格过滤阈值
-  stage2.filter_options.filter_min_tri_angle = 2.5;
-  stage2.complete_max_reproj_error = 3.0;                // 严格补全阈值
+  stage2.filter_options.filter_max_reproj_error = filter_max_reproj_error;   // 严格过滤阈值
+  stage2.filter_options.filter_min_tri_angle = 2.0;
+  stage2.complete_max_reproj_error = tri_max_project_error;                // 严格补全阈值
   stage2.ba_options = mapper_options.GlobalBundleAdjustment();
   stage2.ba_options.refine_focal_length = true;
   stage2.ba_options.refine_principal_point = false;
   stage2.ba_options.refine_extra_params = true;
   stage2.ba_options.refine_extrinsics = true;
+  //stage2.ba_options.solver_options.function_tolerance = 1e-5; // 放宽收敛条件，快速迭代
   stage2.ba_options.loss_function_type =
-      BundleAdjustmentOptions::LossFunctionType::TRIVIAL;  // 非鲁棒损失
+      BundleAdjustmentOptions::LossFunctionType::HUBER;  // 非鲁棒损失
+  stage2.ba_options.loss_function_scale = filter_max_reproj_error;
 
   // 依次执行两个阶段
   if (!RunIterativeStage(stage1, tracks, mapper_options, &mapper, reconstruction,
@@ -3980,6 +4139,9 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
     mapper.EndReconstruction(true);
     return false;
   }
+
+  //reconstruction->Write("/data/vpgo/data_1/sfm_result/pgo_test_pgo_ba0");
+
   if (!RunIterativeStage(stage2, tracks, mapper_options, &mapper, reconstruction,
                          &camera_rigs, rig_ba_options, ba_config)) {
     mapper.EndReconstruction(true);
@@ -3987,8 +4149,8 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   }
 
   // ---- 最终清理：严格过滤 + 删除短轨迹 ----
-  const double kStrictMaxReprojError = 3.0;
-  const double kStrictMinTriAngle = 2.5;
+  const double kStrictMaxReprojError = 4.0;
+  const double kStrictMinTriAngle = 2.;
   const size_t kMinTrackLength = 3;
   const size_t final_filtered =
       reconstruction->FilterAllPoints3D(kStrictMaxReprojError, kStrictMinTriAngle);
@@ -4984,6 +5146,12 @@ int main(int argc, char** argv) {
                                    post_pgo_error_path);
   }
 
+//   // save pgo result
+//   {
+//     std::cout << "Save pgo result to " << options.output_path + "_pgo" << "\n";
+//     CreateDirIfNotExists(options.output_path + "_pgo", true);
+//     reconstruction.Write(options.output_path + "_pgo");
+//   }
   // ========== 9. 三角化与迭代优化 ==========
   if (!TriangulateAndOptimizePaperStyle(&reconstruction, &database,
                                         options.rig_config_path)) {
