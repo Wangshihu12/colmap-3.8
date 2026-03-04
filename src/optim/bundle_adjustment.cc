@@ -31,7 +31,10 @@
 
 #include "optim/bundle_adjustment.h"
 
+#include <algorithm>
+#include <cmath>
 #include <iomanip>
+#include <numeric>
 
 #ifdef OPENMP_ENABLED
 #include <omp.h>
@@ -949,6 +952,7 @@ void RigBundleAdjuster::SetUp(Reconstruction* reconstruction,
     AddPointToProblem(point3D_id, reconstruction, loss_function);
   }
 
+  AddRigRelativePoseConstraints(loss_function);
   ParameterizeCameras(reconstruction);
   ParameterizePoints(reconstruction);
   ParameterizeCameraRigs(reconstruction);
@@ -1198,6 +1202,51 @@ void RigBundleAdjuster::AddPointToProblem(const point3D_t point3D_id,
 
 #undef CAMERA_MODEL_CASE
     }
+  }
+}
+
+void RigBundleAdjuster::AddRigRelativePoseConstraints(
+    ceres::LossFunction* loss_function) {
+  if (!options_.refine_extrinsics) {
+    return;
+  }
+
+  for (const auto& constraint : config_.RelativePoseConstraints()) {
+    if (!config_.HasImage(constraint.image_id1) ||
+        !config_.HasImage(constraint.image_id2)) {
+      continue;
+    }
+
+    // 获取两张图像对应的位姿
+    const auto it_qvec1 = image_id_to_rig_qvec_.find(constraint.image_id1);
+    const auto it_tvec1 = image_id_to_rig_tvec_.find(constraint.image_id1);
+    const auto it_qvec2 = image_id_to_rig_qvec_.find(constraint.image_id2);
+    const auto it_tvec2 = image_id_to_rig_tvec_.find(constraint.image_id2);
+    if (it_qvec1 == image_id_to_rig_qvec_.end() ||
+        it_tvec1 == image_id_to_rig_tvec_.end() ||
+        it_qvec2 == image_id_to_rig_qvec_.end() ||
+        it_tvec2 == image_id_to_rig_tvec_.end()) {
+      continue;
+    }
+
+    double* qvec1_data = it_qvec1->second->data();
+    double* tvec1_data = it_tvec1->second->data();
+    double* qvec2_data = it_qvec2->second->data();
+    double* tvec2_data = it_tvec2->second->data();
+
+    // 同一个snapshot不添加约束
+    if (qvec1_data == qvec2_data && tvec1_data == tvec2_data) {
+      continue;
+    }
+
+    ceres::CostFunction* cost_function = RelativePoseConstraintCostFunction::Create(
+        constraint.qvec12, constraint.tvec12, constraint.rot_weight,
+        constraint.trans_weight);
+    problem_->AddResidualBlock(cost_function, loss_function, qvec1_data,
+                               tvec1_data, qvec2_data, tvec2_data);
+
+    parameterized_qvec_data_.insert(qvec1_data);
+    parameterized_qvec_data_.insert(qvec2_data);
   }
 }
 

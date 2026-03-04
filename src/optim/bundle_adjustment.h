@@ -320,6 +320,7 @@ class RigBundleAdjuster : public BundleAdjuster {
   void AddPointToProblem(const point3D_t point3D_id,
                          Reconstruction* reconstruction,
                          ceres::LossFunction* loss_function);
+  void AddRigRelativePoseConstraints(ceres::LossFunction* loss_function);
 
   void ComputeCameraRigPoses(const Reconstruction& reconstruction,
                              const std::vector<CameraRig>& camera_rigs);

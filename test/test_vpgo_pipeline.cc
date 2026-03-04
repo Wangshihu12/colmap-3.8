@@ -823,14 +823,17 @@ struct PipelineOptions {
   EdgeDefaults defaults;
   Sim3EstimationOptions sim3_options;
   int stage1_max_iterations = 2;
-  double stage1_tri_max_project_error = 18.0;
-  double stage1_filter_max_reproj_error = 18.0;
+  double stage1_tri_max_project_error = 16.0;
+  double stage1_filter_max_reproj_error = 16.0;
   int stage2_max_iterations = 2;
   double stage2_tri_max_project_error = 4.0;
   double stage2_filter_max_reproj_error = 4.0;
   int stage3_max_iterations = 3;
   double stage3_tri_max_project_error = 4.0;
   double stage3_filter_max_reproj_error = 4.0;
+  bool enable_snapshot_relative_pose_constraints = true;
+  double snapshot_relative_pose_rot_weight = 10000.0;
+  double snapshot_relative_pose_trans_weight = 10000.0;
 };
 
 bool IsNumericToken(const std::string& token) {
@@ -3346,6 +3349,9 @@ void PrintUsage() {
          "  --stage3-max-iterations <n>       Final stage iterations.\n"
          "  --stage3-tri-max-project-error <px> Final triangulation max reproj error.\n"
          "  --stage3-filter-max-reproj-error <px> Final filter max reproj error.\n"
+         "  --enable-snapshot-relative-pose-constraints Enable rig snapshot relative pose constraints in Rig BA.\n"
+         "  --snapshot-relative-pose-rot-weight <w> Rotation weight for snapshot constraints.\n"
+         "  --snapshot-relative-pose-trans-weight <w> Translation weight for snapshot constraints.\n"
          "  --eval-threshold <px> Fail if mean reprojection error exceeds.\n"
          "  --self-test           Run IO self-test and exit.\n";
 }
@@ -3460,6 +3466,18 @@ bool ParseArgs(int argc, char** argv, PipelineOptions* options) {
       options->stage3_filter_max_reproj_error = std::stod(argv[++i]);
       continue;
     }
+    if (arg == "--enable-snapshot-relative-pose-constraints") {
+      options->enable_snapshot_relative_pose_constraints = true;
+      continue;
+    }
+    if (arg == "--snapshot-relative-pose-rot-weight" && i + 1 < argc) {
+      options->snapshot_relative_pose_rot_weight = std::stod(argv[++i]);
+      continue;
+    }
+    if (arg == "--snapshot-relative-pose-trans-weight" && i + 1 < argc) {
+      options->snapshot_relative_pose_trans_weight = std::stod(argv[++i]);
+      continue;
+    }
     // 可选参数：评估阈值（像素）
     if (arg == "--eval-threshold" && i + 1 < argc) {
       options->eval_threshold_px = std::stod(argv[++i]);
@@ -3559,6 +3577,7 @@ struct IterativeStageOptions {
   double far_point_max_dist_ratio = 10.0; // 每轮BA前删除极远点阈值(相对中位数)
   int landmark_uniform_num = 128; // 每轮BA前均匀化保留数量
   bool refine_rig_relative_poses = true; // 是否优化rig相对位姿
+  bool use_snapshot_relative_pose_constraints = false; // 是否添加snapshot间位姿约束
   TrackTriangulationOptions triangulation_options;
   BundleAdjustmentOptions ba_options;
   IncrementalMapper::Options filter_options;
@@ -3680,6 +3699,130 @@ size_t RemoveFarPointsByCameraDistance(Reconstruction* reconstruction,
     }
   }
   return removed;
+}
+
+std::vector<RelativePoseConstraint>
+BuildRigSnapshotRelativePoseConstraintsFromDatabase(
+    Database* database, const Reconstruction& reconstruction,
+    const std::vector<CameraRig>& camera_rigs, const double rot_weight,
+    const double trans_weight) {
+  std::vector<RelativePoseConstraint> constraints;
+  if (database == nullptr || camera_rigs.empty()) {
+    return constraints;
+  }
+
+  // 获取数据库中所有图像信息
+  std::unordered_map<image_t, Image> db_images;
+  const auto all_db_images = database->ReadAllImages();
+  db_images.reserve(all_db_images.size());
+  for (const auto& image : all_db_images) {
+    db_images.emplace(image.ImageId(), image);
+  }
+
+  struct SnapshotPriorPose {
+    image_t ref_image_id = kInvalidImageId;
+    Eigen::Vector4d rig_qvec = ComposeIdentityQuaternion();
+    Eigen::Vector3d rig_tvec = Eigen::Vector3d::Zero();
+    double timestamp = 0.0;
+  };
+
+  for (const auto& camera_rig : camera_rigs) {
+    if (camera_rig.NumSnapshots() < 2) {
+      continue;
+    }
+
+    // 确保rig中的参考相机存在与重建中
+    const camera_t ref_camera_id = camera_rig.RefCameraId();
+    if (!camera_rig.HasCamera(ref_camera_id)) {
+      continue;
+    }
+
+    // 计算参考相机相对于rig坐标系的逆变换，用于将图像先验位姿转换到rig坐标系
+    Eigen::Vector4d inv_ref_rel_qvec = ComposeIdentityQuaternion();
+    Eigen::Vector3d inv_ref_rel_tvec = Eigen::Vector3d::Zero();
+    InvertPose(camera_rig.RelativeQvec(ref_camera_id),
+               camera_rig.RelativeTvec(ref_camera_id), &inv_ref_rel_qvec,
+               &inv_ref_rel_tvec);
+
+    std::vector<SnapshotPriorPose> snapshot_poses;
+    snapshot_poses.reserve(camera_rig.NumSnapshots());
+
+    for (const auto& snapshot : camera_rig.Snapshots()) {
+      image_t ref_image_id = kInvalidImageId;
+      // 在重建中找到该快照对应的参考图像ID
+      for (const auto image_id : snapshot) {
+        if (!reconstruction.ExistsImage(image_id)) {
+          continue;
+        }
+        const auto& rec_image = reconstruction.Image(image_id);
+        if (rec_image.CameraId() == ref_camera_id) {
+          ref_image_id = image_id;
+          break;
+        }
+      }
+
+      if (ref_image_id == kInvalidImageId) {
+        continue;
+      }
+
+      const auto db_it = db_images.find(ref_image_id);
+      if (db_it == db_images.end()) {
+        continue;
+      }
+      const auto& db_image = db_it->second;
+      if (!db_image.HasQvecPrior() || !db_image.HasTvecPrior()) {
+        continue;
+      }
+
+      // 从数据库中获取参考图像的先验位姿
+      SnapshotPriorPose snapshot_pose;
+      snapshot_pose.ref_image_id = ref_image_id;
+      ConcatenatePoses(db_image.QvecPrior(), db_image.TvecPrior(),
+                       inv_ref_rel_qvec, inv_ref_rel_tvec,
+                       &snapshot_pose.rig_qvec, &snapshot_pose.rig_tvec);
+      snapshot_pose.rig_qvec = NormalizeQuaternion(snapshot_pose.rig_qvec);
+      if (!std::isfinite(snapshot_pose.rig_qvec.norm()) ||
+          !std::isfinite(snapshot_pose.rig_tvec.norm())) {
+        continue;
+      }
+      snapshot_pose.timestamp = static_cast<double>(ref_image_id);
+      TryParseImageTimestamp(reconstruction.Image(ref_image_id).Name(),
+                             &snapshot_pose.timestamp);
+      snapshot_poses.push_back(snapshot_pose);
+    }
+
+    if (snapshot_poses.size() < 2) {
+      continue;
+    }
+
+    // 根据时间戳排序snapshot位姿
+    std::sort(snapshot_poses.begin(), snapshot_poses.end(),
+              [](const SnapshotPriorPose& a, const SnapshotPriorPose& b) {
+                if (a.timestamp == b.timestamp) {
+                  return a.ref_image_id < b.ref_image_id;
+                }
+                return a.timestamp < b.timestamp;
+              });
+
+    // 为同一rig的每对相邻snapshot构建一个相对位姿约束
+    constraints.reserve(constraints.size() + snapshot_poses.size() - 1);
+    for (size_t i = 0; i + 1 < snapshot_poses.size(); ++i) {
+      const auto& pose1 = snapshot_poses[i];
+      const auto& pose2 = snapshot_poses[i + 1];
+      RelativePoseConstraint constraint;
+      constraint.image_id1 = pose1.ref_image_id;
+      constraint.image_id2 = pose2.ref_image_id;
+      ComputeRelativePose(pose1.rig_qvec, pose1.rig_tvec, pose2.rig_qvec,
+                          pose2.rig_tvec, &constraint.qvec12,
+                          &constraint.tvec12);
+      constraint.qvec12 = NormalizeQuaternion(constraint.qvec12);
+      constraint.rot_weight = rot_weight;
+      constraint.trans_weight = trans_weight;
+      constraints.push_back(constraint);
+    }
+  }
+
+  return constraints;
 }
 
 /**
@@ -4085,7 +4228,9 @@ bool RunIterativeStage(const IterativeStageOptions& stage_options,
                        IncrementalMapper* mapper, Reconstruction* reconstruction,
                        std::vector<CameraRig>* camera_rigs,
                        const RigBundleAdjuster::Options& rig_ba_options,
-                       const BundleAdjustmentConfig& ba_config) {
+                       const BundleAdjustmentConfig& ba_config,
+                       const std::vector<RelativePoseConstraint>&
+                           snapshot_relative_pose_constraints) {
   if (mapper == nullptr || reconstruction == nullptr || camera_rigs == nullptr) {
     return false;
   }
@@ -4153,8 +4298,17 @@ bool RunIterativeStage(const IterativeStageOptions& stage_options,
     auto iter_rig_ba_options = rig_ba_options;
     iter_rig_ba_options.refine_relative_poses =
         stage_options.refine_rig_relative_poses;
-    RigBundleAdjuster bundle_adjuster(stage_options.ba_options, iter_rig_ba_options,
-                                      ba_config);
+    BundleAdjustmentConfig iter_ba_config = ba_config;
+    if (stage_options.use_snapshot_relative_pose_constraints) {
+      for (const auto& constraint : snapshot_relative_pose_constraints) {
+        iter_ba_config.AddRelativePoseConstraint(constraint);
+      }
+      std::cout << "  => Added snapshot relative pose constraints: "
+                << iter_ba_config.NumRelativePoseConstraints() << "\n";
+    }
+
+    RigBundleAdjuster bundle_adjuster(stage_options.ba_options,
+                                      iter_rig_ba_options, iter_ba_config);
     if (!bundle_adjuster.Solve(reconstruction, camera_rigs)) {
       std::cout << "ERROR: bundle adjustment failed in stage "
                 << stage_options.name << ".\n";
@@ -4269,6 +4423,27 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
     }
   }
 
+  // 构建snapshot相对位姿约束
+  std::vector<RelativePoseConstraint> snapshot_relative_pose_constraints;
+  if (options.enable_snapshot_relative_pose_constraints) {
+    if (camera_rigs.empty()) {
+      std::cout << "Snapshot relative pose constraints enabled, but no rig "
+                   "configuration was loaded.\n";
+    } else {
+      // 从数据库中构建snapshot相对位姿约束
+      snapshot_relative_pose_constraints =
+          BuildRigSnapshotRelativePoseConstraintsFromDatabase(
+              database, *reconstruction, camera_rigs,
+              options.snapshot_relative_pose_rot_weight,
+              options.snapshot_relative_pose_trans_weight);
+      std::cout << "Built snapshot relative pose constraints from database: "
+                << snapshot_relative_pose_constraints.size() << "\n";
+    }
+  }
+  const bool use_snapshot_relative_pose_constraints =
+      options.enable_snapshot_relative_pose_constraints &&
+      !snapshot_relative_pose_constraints.empty();
+
   // ---- Stage 1: 固定内参 + 固定rig约束，只优化外参 ----
   IterativeStageOptions stage1;
   mapper_options.ba_refine_focal_length = false;
@@ -4286,6 +4461,7 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   stage1.far_point_max_dist_ratio = 12.0;
   stage1.landmark_uniform_num = 128;
   stage1.refine_rig_relative_poses = false;
+  stage1.use_snapshot_relative_pose_constraints = use_snapshot_relative_pose_constraints;
   stage1.triangulation_options.min_inlier_track_length = 3;
   stage1.triangulation_options.triangulation.min_tri_angle = DegToRad(2.0);
   stage1.triangulation_options.triangulation.residual_type =
@@ -4322,6 +4498,7 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   stage2.far_point_max_dist_ratio = 10.0;
   stage2.landmark_uniform_num = 128;
   stage2.refine_rig_relative_poses = true;
+  stage2.use_snapshot_relative_pose_constraints = use_snapshot_relative_pose_constraints;
   stage2.triangulation_options.min_inlier_track_length = 3;
   stage2.triangulation_options.triangulation.min_tri_angle = DegToRad(2.0);
   stage2.triangulation_options.triangulation.residual_type =
@@ -4357,6 +4534,7 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   stage3.far_point_max_dist_ratio = 8.0;
   stage3.landmark_uniform_num = 128;
   stage3.refine_rig_relative_poses = true;
+  stage3.use_snapshot_relative_pose_constraints = use_snapshot_relative_pose_constraints;
   stage3.triangulation_options.min_inlier_track_length = 3;
   stage3.triangulation_options.triangulation.min_tri_angle = DegToRad(2.0);
   stage3.triangulation_options.triangulation.residual_type =
@@ -4383,7 +4561,8 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
 
   // 依次执行三个阶段
   if (!RunIterativeStage(stage1, tracks, mapper_options, &mapper, reconstruction,
-                         &camera_rigs, rig_ba_options, ba_config)) {
+                         &camera_rigs, rig_ba_options, ba_config,
+                         snapshot_relative_pose_constraints)) {
     mapper.EndReconstruction(true);
     return false;
   }
@@ -4392,7 +4571,8 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   reconstruction->Write("/home/xgrids/文档/data_need_pgo/data_1/0/test_pgo/pgo_test_ba1");
 
   if (!RunIterativeStage(stage2, tracks, mapper_options, &mapper, reconstruction,
-                         &camera_rigs, rig_ba_options, ba_config)) {
+                         &camera_rigs, rig_ba_options, ba_config,
+                         snapshot_relative_pose_constraints)) {
     mapper.EndReconstruction(true);
     return false;
   }
@@ -4401,7 +4581,8 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   reconstruction->Write("/home/xgrids/文档/data_need_pgo/data_1/0/test_pgo/pgo_test_ba2");
 
   if (!RunIterativeStage(stage3, tracks, mapper_options, &mapper, reconstruction,
-                         &camera_rigs, rig_ba_options, ba_config)) {
+                         &camera_rigs, rig_ba_options, ba_config,
+                         snapshot_relative_pose_constraints)) {
     mapper.EndReconstruction(true);
     return false;
   }
@@ -4433,9 +4614,9 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
     std::cout << "  => Removed short tracks: " << removed_tracks << "\n";
   }
 
-  // 过滤质量不佳的图像
-  const size_t num_filtered_images = mapper.FilterImages(stage3.filter_options);
-  std::cout << "  => Filtered images: " << num_filtered_images << "\n";
+  // // 过滤质量不佳的图像
+  // const size_t num_filtered_images = mapper.FilterImages(stage3.filter_options);
+  // std::cout << "  => Filtered images: " << num_filtered_images << "\n";
 
   mapper.EndReconstruction(false);
   return true;
