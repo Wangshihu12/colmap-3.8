@@ -799,6 +799,8 @@ struct Sim3EstimationOptions {
   double ransac_min_inlier_ratio = 0.25;
 };
 
+enum class SnapshotRelativePoseSource { DATABASE, RECONSTRUCTION };
+
 struct PipelineOptions {
   std::string sparse_path;
   std::string database_path;
@@ -832,14 +834,51 @@ struct PipelineOptions {
   double stage3_tri_max_project_error = 4.0;
   double stage3_filter_max_reproj_error = 4.0;
   bool enable_snapshot_relative_pose_constraints = true;
-  double snapshot_relative_pose_rot_weight = 10000.0;
-  double snapshot_relative_pose_trans_weight = 10000.0;
+  double snapshot_relative_pose_rot_weight = 100.0;
+  double snapshot_relative_pose_trans_weight = 100.0;
+  size_t snapshot_relative_pose_window = 5;
+  SnapshotRelativePoseSource snapshot_relative_pose_source =
+      SnapshotRelativePoseSource::RECONSTRUCTION;
 };
 
 bool IsNumericToken(const std::string& token) {
   char* end_ptr = nullptr;
   std::strtod(token.c_str(), &end_ptr);
   return end_ptr != token.c_str() && *end_ptr == '\0';
+}
+
+std::string ToLowerString(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](const unsigned char c) { return std::tolower(c); });
+  return value;
+}
+
+bool ParseSnapshotRelativePoseSource(
+    const std::string& token, SnapshotRelativePoseSource* source) {
+  if (source == nullptr) {
+    return false;
+  }
+  const std::string value = ToLowerString(token);
+  if (value == "database" || value == "db") {
+    *source = SnapshotRelativePoseSource::DATABASE;
+    return true;
+  }
+  if (value == "reconstruction" || value == "rec") {
+    *source = SnapshotRelativePoseSource::RECONSTRUCTION;
+    return true;
+  }
+  return false;
+}
+
+const char* SnapshotRelativePoseSourceToString(
+    const SnapshotRelativePoseSource source) {
+  switch (source) {
+    case SnapshotRelativePoseSource::DATABASE:
+      return "database";
+    case SnapshotRelativePoseSource::RECONSTRUCTION:
+      return "reconstruction";
+  }
+  return "unknown";
 }
 
 std::string GetBaseName(const std::string& name) {
@@ -3352,6 +3391,8 @@ void PrintUsage() {
          "  --enable-snapshot-relative-pose-constraints Enable rig snapshot relative pose constraints in Rig BA.\n"
          "  --snapshot-relative-pose-rot-weight <w> Rotation weight for snapshot constraints.\n"
          "  --snapshot-relative-pose-trans-weight <w> Translation weight for snapshot constraints.\n"
+         "  --snapshot-relative-pose-window <n> Connect each snapshot to next n snapshots.\n"
+         "  --snapshot-relative-pose-source <database|reconstruction> Pose source for snapshot constraints.\n"
          "  --eval-threshold <px> Fail if mean reprojection error exceeds.\n"
          "  --self-test           Run IO self-test and exit.\n";
 }
@@ -3476,6 +3517,20 @@ bool ParseArgs(int argc, char** argv, PipelineOptions* options) {
     }
     if (arg == "--snapshot-relative-pose-trans-weight" && i + 1 < argc) {
       options->snapshot_relative_pose_trans_weight = std::stod(argv[++i]);
+      continue;
+    }
+    if (arg == "--snapshot-relative-pose-window" && i + 1 < argc) {
+      options->snapshot_relative_pose_window = std::stoul(argv[++i]);
+      continue;
+    }
+    if (arg == "--snapshot-relative-pose-source" && i + 1 < argc) {
+      const std::string source_token = argv[++i];
+      if (!ParseSnapshotRelativePoseSource(
+              source_token, &options->snapshot_relative_pose_source)) {
+        std::cout << "Invalid --snapshot-relative-pose-source: "
+                  << source_token << "\n";
+        return false;
+      }
       continue;
     }
     // 可选参数：评估阈值（像素）
@@ -3604,6 +3659,7 @@ size_t RemoveShortTracks(Reconstruction* reconstruction,
   return removed;
 }
 
+// 过滤极远点
 size_t RemoveFarPointsByCameraDistance(Reconstruction* reconstruction,
                                        const double max_dist_ratio) {
   if (reconstruction == nullptr || max_dist_ratio <= 0.0) {
@@ -3702,21 +3758,30 @@ size_t RemoveFarPointsByCameraDistance(Reconstruction* reconstruction,
 }
 
 std::vector<RelativePoseConstraint>
-BuildRigSnapshotRelativePoseConstraintsFromDatabase(
+BuildRigSnapshotRelativePoseConstraints(
     Database* database, const Reconstruction& reconstruction,
     const std::vector<CameraRig>& camera_rigs, const double rot_weight,
-    const double trans_weight) {
+    const double trans_weight, const size_t window_size,
+    const SnapshotRelativePoseSource pose_source) {
   std::vector<RelativePoseConstraint> constraints;
-  if (database == nullptr || camera_rigs.empty()) {
+  if (camera_rigs.empty()) {
     return constraints;
   }
+  const bool use_database_pose =
+      pose_source == SnapshotRelativePoseSource::DATABASE;
+  if (use_database_pose && database == nullptr) {
+    return constraints;
+  }
+  const size_t effective_window = std::max<size_t>(1, window_size);
 
-  // 获取数据库中所有图像信息
   std::unordered_map<image_t, Image> db_images;
-  const auto all_db_images = database->ReadAllImages();
-  db_images.reserve(all_db_images.size());
-  for (const auto& image : all_db_images) {
-    db_images.emplace(image.ImageId(), image);
+  if (use_database_pose) {
+    // 从database中读取所有图像信息
+    const auto all_db_images = database->ReadAllImages();
+    db_images.reserve(all_db_images.size());
+    for (const auto& image : all_db_images) {
+      db_images.emplace(image.ImageId(), image);
+    }
   }
 
   struct SnapshotPriorPose {
@@ -3755,6 +3820,9 @@ BuildRigSnapshotRelativePoseConstraintsFromDatabase(
           continue;
         }
         const auto& rec_image = reconstruction.Image(image_id);
+        if (!use_database_pose && !rec_image.IsRegistered()) {
+          continue;
+        }
         if (rec_image.CameraId() == ref_camera_id) {
           ref_image_id = image_id;
           break;
@@ -3765,21 +3833,28 @@ BuildRigSnapshotRelativePoseConstraintsFromDatabase(
         continue;
       }
 
-      const auto db_it = db_images.find(ref_image_id);
-      if (db_it == db_images.end()) {
-        continue;
-      }
-      const auto& db_image = db_it->second;
-      if (!db_image.HasQvecPrior() || !db_image.HasTvecPrior()) {
-        continue;
-      }
-
-      // 从数据库中获取参考图像的先验位姿
       SnapshotPriorPose snapshot_pose;
       snapshot_pose.ref_image_id = ref_image_id;
-      ConcatenatePoses(db_image.QvecPrior(), db_image.TvecPrior(),
-                       inv_ref_rel_qvec, inv_ref_rel_tvec,
-                       &snapshot_pose.rig_qvec, &snapshot_pose.rig_tvec);
+      if (use_database_pose) {
+        // 使用database中参考图像的先验位姿
+        const auto db_it = db_images.find(ref_image_id);
+        if (db_it == db_images.end()) {
+          continue;
+        }
+        const auto& db_image = db_it->second;
+        if (!db_image.HasQvecPrior() || !db_image.HasTvecPrior()) {
+          continue;
+        }
+        ConcatenatePoses(db_image.QvecPrior(), db_image.TvecPrior(),
+                         inv_ref_rel_qvec, inv_ref_rel_tvec,
+                         &snapshot_pose.rig_qvec, &snapshot_pose.rig_tvec);
+      } else {
+        // 使用重建中的参考图像位姿（PGO优化后已写回reconstruction）
+        const auto& ref_image = reconstruction.Image(ref_image_id);
+        ConcatenatePoses(ref_image.Qvec(), ref_image.Tvec(),
+                         inv_ref_rel_qvec, inv_ref_rel_tvec,
+                         &snapshot_pose.rig_qvec, &snapshot_pose.rig_tvec);
+      }
       snapshot_pose.rig_qvec = NormalizeQuaternion(snapshot_pose.rig_qvec);
       if (!std::isfinite(snapshot_pose.rig_qvec.norm()) ||
           !std::isfinite(snapshot_pose.rig_tvec.norm())) {
@@ -3804,21 +3879,30 @@ BuildRigSnapshotRelativePoseConstraintsFromDatabase(
                 return a.timestamp < b.timestamp;
               });
 
-    // 为同一rig的每对相邻snapshot构建一个相对位姿约束
-    constraints.reserve(constraints.size() + snapshot_poses.size() - 1);
+    // 为同一rig的每个snapshot与其后续窗口内的snapshot构建相对位姿约束
+    size_t num_new_constraints = 0;
+    for (size_t i = 0; i + 1 < snapshot_poses.size(); ++i) {
+      num_new_constraints +=
+          std::min(effective_window, snapshot_poses.size() - 1 - i);
+    }
+    constraints.reserve(constraints.size() + num_new_constraints);
     for (size_t i = 0; i + 1 < snapshot_poses.size(); ++i) {
       const auto& pose1 = snapshot_poses[i];
-      const auto& pose2 = snapshot_poses[i + 1];
-      RelativePoseConstraint constraint;
-      constraint.image_id1 = pose1.ref_image_id;
-      constraint.image_id2 = pose2.ref_image_id;
-      ComputeRelativePose(pose1.rig_qvec, pose1.rig_tvec, pose2.rig_qvec,
-                          pose2.rig_tvec, &constraint.qvec12,
-                          &constraint.tvec12);
-      constraint.qvec12 = NormalizeQuaternion(constraint.qvec12);
-      constraint.rot_weight = rot_weight;
-      constraint.trans_weight = trans_weight;
-      constraints.push_back(constraint);
+      const size_t max_offset =
+          std::min(effective_window, snapshot_poses.size() - 1 - i);
+      for (size_t offset = 1; offset <= max_offset; ++offset) {
+        const auto& pose2 = snapshot_poses[i + offset];
+        RelativePoseConstraint constraint;
+        constraint.image_id1 = pose1.ref_image_id;
+        constraint.image_id2 = pose2.ref_image_id;
+        ComputeRelativePose(pose1.rig_qvec, pose1.rig_tvec, pose2.rig_qvec,
+                            pose2.rig_tvec, &constraint.qvec12,
+                            &constraint.tvec12);
+        constraint.qvec12 = NormalizeQuaternion(constraint.qvec12);
+        constraint.rot_weight = rot_weight;
+        constraint.trans_weight = trans_weight;
+        constraints.push_back(constraint);
+      }
     }
   }
 
@@ -4430,14 +4514,21 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
       std::cout << "Snapshot relative pose constraints enabled, but no rig "
                    "configuration was loaded.\n";
     } else {
-      // 从数据库中构建snapshot相对位姿约束
+      // 根据配置，从database先验或reconstruction位姿构建snapshot相对位姿约束
       snapshot_relative_pose_constraints =
-          BuildRigSnapshotRelativePoseConstraintsFromDatabase(
+          BuildRigSnapshotRelativePoseConstraints(
               database, *reconstruction, camera_rigs,
               options.snapshot_relative_pose_rot_weight,
-              options.snapshot_relative_pose_trans_weight);
-      std::cout << "Built snapshot relative pose constraints from database: "
-                << snapshot_relative_pose_constraints.size() << "\n";
+              options.snapshot_relative_pose_trans_weight,
+              options.snapshot_relative_pose_window,
+              options.snapshot_relative_pose_source);
+      std::cout << "Built snapshot relative pose constraints from "
+                << SnapshotRelativePoseSourceToString(
+                       options.snapshot_relative_pose_source)
+                << ": "
+                << snapshot_relative_pose_constraints.size()
+                << " (window=" << options.snapshot_relative_pose_window
+                << ")\n";
     }
   }
   const bool use_snapshot_relative_pose_constraints =
