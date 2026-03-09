@@ -7,10 +7,12 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <sstream>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -182,6 +184,183 @@ inline bool DistributeLandmarks(
   return true;
 }
 
+struct ViewDiversityFilterResult {
+  size_t removed_observations = 0;
+  bool removed_point = false;
+};
+
+inline ViewDiversityFilterResult FilterPointObservationsByViewDiversity(
+    Reconstruction* reconstruction, const point3D_t point3D_id,
+    const double min_view_angle_deg, const size_t min_num_observations,
+    const image_t min_image_id_gap) {
+  ViewDiversityFilterResult result;
+  if (reconstruction == nullptr || !reconstruction->ExistsPoint3D(point3D_id)) {
+    return result;
+  }
+  if (min_view_angle_deg <= 0.0 || min_num_observations <= 1) {
+    return result;
+  }
+
+  struct ObsWithDir {
+    TrackElement track_el;
+    Eigen::Vector3d dir = Eigen::Vector3d::Zero();
+  };
+
+  // 获取当前3d点的坐标与观测信息
+  const Eigen::Vector3d point_xyz = reconstruction->Point3D(point3D_id).XYZ();
+  const auto track_elements =
+      reconstruction->Point3D(point3D_id).Track().Elements();
+
+  std::vector<ObsWithDir> observations;
+  observations.reserve(track_elements.size());
+  std::vector<TrackElement> invalid_observations;
+  invalid_observations.reserve(track_elements.size());
+
+  // 遍历所有观测
+  for (const auto& track_el : track_elements) {
+    // 检查是否存在对应的图像
+    if (!reconstruction->ExistsImage(track_el.image_id)) {
+      invalid_observations.push_back(track_el);
+      continue;
+    }
+    // 检查是否存在对应的2d点
+    const auto& image = reconstruction->Image(track_el.image_id);
+    if (!image.IsRegistered() || track_el.point2D_idx >= image.NumPoints2D()) {
+      invalid_observations.push_back(track_el);
+      continue;
+    }
+
+    // 计算观测方向
+    const Eigen::Vector3d ray = image.ProjectionCenter() - point_xyz;
+    const double ray_norm = ray.norm();
+    if (!std::isfinite(ray_norm) || ray_norm <= 1e-12) {
+      invalid_observations.push_back(track_el);
+      continue;
+    }
+
+    ObsWithDir obs;
+    obs.track_el = track_el;
+    obs.dir = ray / ray_norm;
+    observations.push_back(obs);
+  }
+
+  // 检查观测数量是否足够
+  if (observations.size() < min_num_observations) {
+    reconstruction->DeletePoint3D(point3D_id);
+    result.removed_point = true;
+    return result;
+  }
+
+  // 按照图像ID和2D点索引排序观测
+  std::sort(observations.begin(), observations.end(),
+            [](const ObsWithDir& a, const ObsWithDir& b) {
+              if (a.track_el.image_id == b.track_el.image_id) {
+                return a.track_el.point2D_idx < b.track_el.point2D_idx;
+              }
+              return a.track_el.image_id < b.track_el.image_id;
+            });
+
+  const double cos_threshold = std::cos(DegToRad(min_view_angle_deg));
+  std::vector<ObsWithDir> kept_observations;
+  kept_observations.reserve(observations.size());
+
+  // 遍历观测，保留视角多样的观测，并记录需要删除的观测
+  std::vector<TrackElement> observations_to_remove = invalid_observations;
+  observations_to_remove.reserve(observations.size());
+  for (const auto& obs : observations) {
+    bool keep_obs = kept_observations.empty();
+    if (!keep_obs) {
+      double max_cos = -1.0;
+      image_t min_gap = std::numeric_limits<image_t>::max();
+      for (const auto& kept_obs : kept_observations) {
+        // 最小角度
+        max_cos = std::max(max_cos, kept_obs.dir.dot(obs.dir));
+
+        // 最小时间间隔
+        const image_t cur_image_id = obs.track_el.image_id;
+        const image_t kept_image_id = kept_obs.track_el.image_id;
+        const image_t gap = cur_image_id >= kept_image_id
+                                ? (cur_image_id - kept_image_id)
+                                : (kept_image_id - cur_image_id);
+        min_gap = std::min(min_gap, gap);
+      }
+      // 保留满足角度多样性的观测，同时保留图像id间隔足够大的长时间观测
+      const bool angle_diverse = (max_cos <= cos_threshold);
+      const bool time_diverse =
+          min_image_id_gap > 0 && min_gap >= min_image_id_gap;
+      keep_obs = angle_diverse || time_diverse;
+    }
+
+    if (keep_obs) {
+      kept_observations.push_back(obs);
+    } else {
+      observations_to_remove.push_back(obs.track_el);
+    }
+  }
+
+  // 如果保留的观测数量不足，则删除该3D点
+  if (kept_observations.size() < min_num_observations) {
+    reconstruction->DeletePoint3D(point3D_id);
+    result.removed_point = true;
+    return result;
+  }
+
+  // 删除不满足视角多样性的观测
+  for (const auto& track_el : observations_to_remove) {
+    if (!reconstruction->ExistsPoint3D(point3D_id) ||
+        !reconstruction->ExistsImage(track_el.image_id)) {
+      continue;
+    }
+    const auto& image = reconstruction->Image(track_el.image_id);
+    if (track_el.point2D_idx >= image.NumPoints2D()) {
+      continue;
+    }
+
+    const auto& point2D = image.Point2D(track_el.point2D_idx);
+    if (!point2D.HasPoint3D() || point2D.Point3DId() != point3D_id) {
+      continue;
+    }
+
+    reconstruction->DeleteObservation(track_el.image_id, track_el.point2D_idx);
+    result.removed_observations += 1;
+  }
+
+  if (!reconstruction->ExistsPoint3D(point3D_id)) {
+    result.removed_point = true;
+  }
+  return result;
+}
+
+struct ViewDiversityFilteringStats {
+  size_t removed_observations = 0;
+  size_t removed_points = 0;
+};
+
+inline ViewDiversityFilteringStats FilterObservationsByViewDiversity(
+    Reconstruction* reconstruction, const double min_view_angle_deg,
+    const size_t min_num_observations, const image_t min_image_id_gap) {
+  ViewDiversityFilteringStats stats;
+  if (reconstruction == nullptr || min_view_angle_deg <= 0.0 ||
+      min_num_observations <= 1) {
+    return stats;
+  }
+
+  // 遍历所有3d点，过滤观测
+  const auto point3D_ids = reconstruction->Point3DIds();
+  for (const auto point3D_id : point3D_ids) {
+    if (!reconstruction->ExistsPoint3D(point3D_id)) {
+      continue;
+    }
+    const auto result = FilterPointObservationsByViewDiversity(
+        reconstruction, point3D_id, min_view_angle_deg, min_num_observations,
+        min_image_id_gap);
+    stats.removed_observations += result.removed_observations;
+    if (result.removed_point) {
+      stats.removed_points += 1;
+    }
+  }
+  return stats;
+}
 
 
 namespace {
@@ -3631,6 +3810,9 @@ struct IterativeStageOptions {
   size_t min_track_length = 3; // 每轮BA前删除短轨迹阈值
   double far_point_max_dist_ratio = 10.0; // 每轮BA前删除极远点阈值(相对中位数)
   int landmark_uniform_num = 128; // 每轮BA前均匀化保留数量
+  double landmark_min_view_angle_deg = 3.0; // 观测视角最小夹角阈值
+  size_t landmark_min_diverse_observations = 3; // 视角过滤后最少观测数
+  image_t landmark_min_image_id_gap = 0; // 桥接观测最小图像ID间隔，0表示关闭
   bool refine_rig_relative_poses = true; // 是否优化rig相对位姿
   bool use_snapshot_relative_pose_constraints = false; // 是否添加snapshot间位姿约束
   TrackTriangulationOptions triangulation_options;
@@ -4373,6 +4555,16 @@ bool RunIterativeStage(const IterativeStageOptions& stage_options,
       continue;
     }
 
+    // 视角多样性过滤
+    const auto diversity_stats = FilterObservationsByViewDiversity(
+        reconstruction, stage_options.landmark_min_view_angle_deg,
+        stage_options.landmark_min_diverse_observations,
+        stage_options.landmark_min_image_id_gap);
+    std::cout << "  => View-diversity filtered observations: "
+              << diversity_stats.removed_observations
+              << ", removed points: " << diversity_stats.removed_points
+              << "\n";
+
     // 点云均匀化
     if (stage_options.landmark_uniform_num > 0) {
       DistributeLandmarks(*reconstruction, stage_options.landmark_uniform_num);
@@ -4551,6 +4743,9 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   stage1.min_track_length = 3;
   stage1.far_point_max_dist_ratio = 12.0;
   stage1.landmark_uniform_num = 128;
+  stage1.landmark_min_view_angle_deg = 3.0;
+  stage1.landmark_min_diverse_observations = 3;
+  stage1.landmark_min_image_id_gap = 5;
   stage1.refine_rig_relative_poses = false;
   stage1.use_snapshot_relative_pose_constraints = use_snapshot_relative_pose_constraints;
   stage1.triangulation_options.min_inlier_track_length = 3;
@@ -4588,6 +4783,9 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   stage2.min_track_length = 3;
   stage2.far_point_max_dist_ratio = 10.0;
   stage2.landmark_uniform_num = 128;
+  stage2.landmark_min_view_angle_deg = 3.0;
+  stage2.landmark_min_diverse_observations = 3;
+  stage2.landmark_min_image_id_gap = 5;
   stage2.refine_rig_relative_poses = true;
   stage2.use_snapshot_relative_pose_constraints = use_snapshot_relative_pose_constraints;
   stage2.triangulation_options.min_inlier_track_length = 3;
@@ -4624,6 +4822,9 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   stage3.min_track_length = 3;
   stage3.far_point_max_dist_ratio = 8.0;
   stage3.landmark_uniform_num = 128;
+  stage3.landmark_min_view_angle_deg = 3.0;
+  stage3.landmark_min_diverse_observations = 3;
+  stage3.landmark_min_image_id_gap = 5;
   stage3.refine_rig_relative_poses = true;
   stage3.use_snapshot_relative_pose_constraints = use_snapshot_relative_pose_constraints;
   stage3.triangulation_options.min_inlier_track_length = 3;
@@ -4659,7 +4860,7 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   }
 
   // 保存中间结果，便于分析
-  reconstruction->Write("/home/xgrids/文档/data_need_pgo/data_1/0/test_pgo/pgo_test_ba1");
+  reconstruction->Write("/home/xgrids/文档/data_need_pgo/data_2/0/test_pgo/pgo_test_ba1");
 
   if (!RunIterativeStage(stage2, tracks, mapper_options, &mapper, reconstruction,
                          &camera_rigs, rig_ba_options, ba_config,
@@ -4669,7 +4870,7 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   }
 
   // 保存中间结果，便于分析
-  reconstruction->Write("/home/xgrids/文档/data_need_pgo/data_1/0/test_pgo/pgo_test_ba2");
+  reconstruction->Write("/home/xgrids/文档/data_need_pgo/data_2/0/test_pgo/pgo_test_ba2");
 
   if (!RunIterativeStage(stage3, tracks, mapper_options, &mapper, reconstruction,
                          &camera_rigs, rig_ba_options, ba_config,
