@@ -4761,6 +4761,7 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   stage1.filter_options.filter_min_tri_angle = 2.0;
   stage1.complete_max_reproj_error = tri_max_project_error;                // 宽松补全阈值
   stage1.ba_options = mapper_options.GlobalBundleAdjustment();
+  stage1.ba_options.solver_options.function_tolerance = 1e-4;
   stage1.ba_options.refine_focal_length = false;
   stage1.ba_options.refine_principal_point = false;
   stage1.ba_options.refine_extra_params = false;
@@ -4803,6 +4804,7 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   stage2.filter_options.filter_min_tri_angle = 2.0;
   stage2.complete_max_reproj_error = tri_max_project_error;                // 严格补全阈值
   stage2.ba_options = mapper_options.GlobalBundleAdjustment();
+  stage2.ba_options.solver_options.function_tolerance = 1e-4;
   stage2.ba_options.refine_focal_length = false;
   stage2.ba_options.refine_principal_point = false;
   stage2.ba_options.refine_extra_params = false;
@@ -4843,6 +4845,7 @@ bool TriangulateAndOptimizePaperStyle(Reconstruction* reconstruction,
   stage3.filter_options.filter_min_tri_angle = 2.0;
   stage3.complete_max_reproj_error = tri_max_project_error;
   stage3.ba_options = mapper_options.GlobalBundleAdjustment();
+  stage3.ba_options.solver_options.function_tolerance = 1e-4;
   stage3.ba_options.refine_focal_length = true;
   stage3.ba_options.refine_principal_point = true;
   stage3.ba_options.refine_extra_params = true;
