@@ -98,6 +98,10 @@ size_t BundleAdjustmentConfig::NumConstantPoses() const {
   return constant_poses_.size();
 }
 
+size_t BundleAdjustmentConfig::NumConstantQvecs() const {
+  return constant_qvecs_.size();
+}
+
 size_t BundleAdjustmentConfig::NumConstantTvecs() const {
   return constant_tvecs_.size();
 }
@@ -174,6 +178,7 @@ bool BundleAdjustmentConfig::IsConstantCamera(const camera_t camera_id) const {
 void BundleAdjustmentConfig::SetConstantPose(const image_t image_id) {
   CHECK(HasImage(image_id));
   CHECK(!HasConstantTvec(image_id));
+  CHECK(!HasConstantQvec(image_id));
   constant_poses_.insert(image_id);
 }
 
@@ -183,6 +188,20 @@ void BundleAdjustmentConfig::SetVariablePose(const image_t image_id) {
 
 bool BundleAdjustmentConfig::HasConstantPose(const image_t image_id) const {
   return constant_poses_.find(image_id) != constant_poses_.end();
+}
+
+void BundleAdjustmentConfig::SetConstantQvec(const image_t image_id) {
+  CHECK(HasImage(image_id));
+  CHECK(!HasConstantPose(image_id));
+  constant_qvecs_.insert(image_id);
+}
+
+void BundleAdjustmentConfig::SetVariableQvec(const image_t image_id) {
+  constant_qvecs_.erase(image_id);
+}
+
+bool BundleAdjustmentConfig::HasConstantQvec(const image_t image_id) const {
+  return constant_qvecs_.find(image_id) != constant_qvecs_.end();
 }
 
 void BundleAdjustmentConfig::SetConstantTvec(const image_t image_id,
@@ -438,6 +457,9 @@ void BundleAdjuster::AddImageToProblem(const image_t image_id,
     // Set pose parameterization.
     if (!constant_pose) {
       SetQuaternionManifold(problem_.get(), qvec_data);
+      if (config_.HasConstantQvec(image_id)) {
+        problem_->SetParameterBlockConstant(qvec_data);
+      }
       if (config_.HasConstantTvec(image_id)) {
         const std::vector<int>& constant_tvec_idxs =
             config_.ConstantTvec(image_id);

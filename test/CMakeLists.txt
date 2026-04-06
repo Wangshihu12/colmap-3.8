@@ -12,12 +12,14 @@ set(TEST_VPGO_TARGET test_vpgo)
 set(TEST_VPGO_SIM3_TARGET test_vpgo_sim3)
 set(TEST_LOOP_EDGES_EVAL_TARGET test_loop_edges_eval)
 set(TEST_VPGO_PIPELINE_TARGET test_vpgo_pipeline)
+set(TEST_GLOMAP_TARGET test_glomap)
 
 # 添加可执行文件
 add_executable(${TEST_VPGO_TARGET} test_vpgo_1.cc)
 add_executable(${TEST_VPGO_SIM3_TARGET} test_vpgo_sim3.cc)
 add_executable(${TEST_LOOP_EDGES_EVAL_TARGET} test_loop_edges_eval.cc)
 add_executable(${TEST_VPGO_PIPELINE_TARGET} test_vpgo_pipeline.cc)
+add_executable(${TEST_GLOMAP_TARGET} test_glomap.cc)
 
 # 设置include路径
 target_include_directories(${TEST_VPGO_TARGET} PRIVATE
@@ -39,6 +41,12 @@ target_include_directories(${TEST_LOOP_EDGES_EVAL_TARGET} PRIVATE
 )
 
 target_include_directories(${TEST_VPGO_PIPELINE_TARGET} PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/lib
+    ${COLMAP_INCLUDE_DIRS}
+)
+
+target_include_directories(${TEST_GLOMAP_TARGET} PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/lib
     ${COLMAP_INCLUDE_DIRS}
@@ -69,12 +77,19 @@ target_link_libraries(${TEST_VPGO_PIPELINE_TARGET}
     ${COLMAP_EXTERNAL_LIBRARIES}
 )
 
+target_link_libraries(${TEST_GLOMAP_TARGET}
+    colmap
+    ${COLMAP_INTERNAL_LIBRARIES}
+    ${COLMAP_EXTERNAL_LIBRARIES}
+)
+
 # 如果启用CUDA，还需要链接colmap_cuda库
 if(CUDA_ENABLED)
     target_link_libraries(${TEST_VPGO_TARGET} colmap_cuda)
     target_link_libraries(${TEST_VPGO_SIM3_TARGET} colmap_cuda)
     target_link_libraries(${TEST_LOOP_EDGES_EVAL_TARGET} colmap_cuda)
     target_link_libraries(${TEST_VPGO_PIPELINE_TARGET} colmap_cuda)
+    target_link_libraries(${TEST_GLOMAP_TARGET} colmap_cuda)
 endif()
 
 # 设置输出目录
@@ -91,6 +106,10 @@ set_target_properties(${TEST_LOOP_EDGES_EVAL_TARGET} PROPERTIES
 )
 
 set_target_properties(${TEST_VPGO_PIPELINE_TARGET} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+set_target_properties(${TEST_GLOMAP_TARGET} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 

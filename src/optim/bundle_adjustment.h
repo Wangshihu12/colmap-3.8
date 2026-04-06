@@ -118,6 +118,7 @@ class BundleAdjustmentConfig {
   size_t NumPoints() const;
   size_t NumConstantCameras() const;
   size_t NumConstantPoses() const;
+  size_t NumConstantQvecs() const;
   size_t NumConstantTvecs() const;
   size_t NumVariablePoints() const;
   size_t NumConstantPoints() const;
@@ -144,6 +145,11 @@ class BundleAdjustmentConfig {
   void SetConstantPose(const image_t image_id);
   void SetVariablePose(const image_t image_id);
   bool HasConstantPose(const image_t image_id) const;
+
+  // 仅固定旋转四元数，允许平移继续优化。
+  void SetConstantQvec(const image_t image_id);
+  void SetVariableQvec(const image_t image_id);
+  bool HasConstantQvec(const image_t image_id) const;
 
   // Set the translational part of the pose, hence the constant pose
   // indices may be in [0, 1, 2] and must be unique. Note that the
@@ -178,6 +184,7 @@ class BundleAdjustmentConfig {
   std::unordered_set<point3D_t> variable_point3D_ids_;
   std::unordered_set<point3D_t> constant_point3D_ids_;
   std::unordered_set<image_t> constant_poses_;
+  std::unordered_set<image_t> constant_qvecs_;
   std::unordered_map<image_t, std::vector<int>> constant_tvecs_;
   std::vector<RelativePoseConstraint> relative_pose_constraints_;
 };

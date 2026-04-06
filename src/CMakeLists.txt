@@ -52,6 +52,7 @@ add_subdirectory(controllers)
 add_subdirectory(estimators)
 add_subdirectory(exe)
 add_subdirectory(feature)
+add_subdirectory(glomap)
 add_subdirectory(mvs)
 add_subdirectory(optim)
 add_subdirectory(retrieval)
@@ -87,8 +88,8 @@ if(CUDA_ENABLED)
     target_link_libraries(colmap_cuda colmap)
 
     target_link_libraries(colmap
-        colmap_cuda ${COLMAP_INTERNAL_LIBRARIES} ${COLMAP_EXTERNAL_LIBRARIES})
+        PoseLib colmap_cuda ${COLMAP_INTERNAL_LIBRARIES} ${COLMAP_EXTERNAL_LIBRARIES})
 else()
     target_link_libraries(colmap
-        ${COLMAP_INTERNAL_LIBRARIES} ${COLMAP_EXTERNAL_LIBRARIES})
+        PoseLib ${COLMAP_INTERNAL_LIBRARIES} ${COLMAP_EXTERNAL_LIBRARIES})
 endif()

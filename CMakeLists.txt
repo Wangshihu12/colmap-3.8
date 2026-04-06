@@ -418,6 +418,7 @@ link_directories(${COLMAP_LINK_DIRS})
 add_subdirectory(lib)
 add_subdirectory(src)
 add_subdirectory(test)
+add_subdirectory(lib/PoseLib)
 
 
 ################################################################################
@@ -435,6 +436,7 @@ COLMAP_ADD_SOURCE_DIR(src/controllers CONTROLLERS_SRCS *.h *.cc)
 COLMAP_ADD_SOURCE_DIR(src/estimators ESTIMATORS_SRCS *.h *.cc)
 COLMAP_ADD_SOURCE_DIR(src/exe EXE_SRCS *.h *.cc)
 COLMAP_ADD_SOURCE_DIR(src/feature FEATURE_SRCS *.h *.cc)
+COLMAP_ADD_SOURCE_DIR(src/glomap GLOMAP_SRCS *.h *.cc)
 COLMAP_ADD_SOURCE_DIR(src/mvs MVS_SRCS *.h *.cc *.cu)
 COLMAP_ADD_SOURCE_DIR(src/optim OPTIM_SRCS *.h *.cc)
 COLMAP_ADD_SOURCE_DIR(src/retrieval RETRIEVAL_SRCS *.h *.cc)
@@ -458,6 +460,7 @@ add_library(
     ${ESTIMATORS_SRCS}
     ${EXE_SRCS}
     ${FEATURE_SRCS}
+    ${GLOMAP_SRCS}
     ${MVS_SRCS}
     ${OPTIM_SRCS}
     ${RETRIEVAL_SRCS}
