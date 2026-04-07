@@ -900,6 +900,69 @@ bool IncrementalMapper::AdjustGlobalBundle(
   return true;
 }
 
+/**
+ * [功能描述]：执行基于相机rig约束的全局光束法平差。
+ *            仅在全局BA阶段使用RigBundleAdjuster优化rig绝对位姿、
+ *            rig内相对位姿以及三维点，不会影响local BA的执行逻辑。
+ * @param options：增量式重建的配置选项
+ * @param ba_options：光束法平差的配置选项
+ * @param rig_ba_options：RigBundleAdjuster的配置选项
+ * @param camera_rigs：当前重建可用的相机rig列表，输入输出参数
+ * @return 优化成功返回true，失败返回false
+ */
+bool IncrementalMapper::AdjustRigGlobalBundle(
+    const Options& options, const BundleAdjustmentOptions& ba_options,
+    const RigBundleAdjuster::Options& rig_ba_options,
+    std::vector<CameraRig>* camera_rigs) {
+  CHECK_NOTNULL(reconstruction_);
+  CHECK_NOTNULL(camera_rigs);
+
+  const std::vector<image_t>& reg_image_ids = reconstruction_->RegImageIds();
+
+  CHECK_GE(reg_image_ids.size(), 2) << "At least two images must be "
+                                       "registered for global "
+                                       "bundle-adjustment";
+
+  // 先清理负深度观测，避免rig BA在退化数据上求解不稳定。
+  reconstruction_->FilterObservationsWithNegativeDepth();
+
+  BundleAdjustmentConfig ba_config;
+  for (const image_t image_id : reg_image_ids) {
+    ba_config.AddImage(image_id);
+  }
+
+  AddRelativePoseConstraintsToConfig(&ba_config);
+
+  // RigBundleAdjuster内部会将rig图像改写为“rig绝对位姿 + rig相对位姿”
+  // 的联合参数化，因此不能再把这些图像的绝对位姿直接设为常量。
+  std::unordered_set<image_t> rig_image_ids;
+  for (const auto& camera_rig : *camera_rigs) {
+    for (const auto& snapshot : camera_rig.Snapshots()) {
+      rig_image_ids.insert(snapshot.begin(), snapshot.end());
+    }
+  }
+
+  if (options.fix_existing_images) {
+    for (const image_t image_id : reg_image_ids) {
+      if (existing_image_ids_.count(image_id) &&
+          rig_image_ids.count(image_id) == 0) {
+        ba_config.SetConstantPose(image_id);
+      }
+    }
+  }
+
+  RigBundleAdjuster bundle_adjuster(ba_options, rig_ba_options, ba_config);
+  if (!bundle_adjuster.Solve(reconstruction_, camera_rigs)) {
+    return false;
+  }
+
+  if (options.normalize_scene) {
+    reconstruction_->Normalize();
+  }
+
+  return true;
+}
+
 bool IncrementalMapper::AdjustParallelGlobalBundle(
     const Options& options, const BundleAdjustmentOptions& ba_options,
     const ParallelBundleAdjuster::Options& parallel_ba_options) {

@@ -145,6 +145,12 @@ struct IncrementalMapperOptions {
   // Normalize the scene after global bundle adjustment.
   bool normalize_scene = false;
 
+  // 是否在全局BA中根据rig配置启用RigBundleAdjuster。
+  bool use_rig_config = false;
+
+  // rig配置JSON文件路径，仅在 use_rig_config=true 时生效。
+  std::string rig_config_path;
+
   IncrementalMapper::Options Mapper() const;
   IncrementalTriangulator::Options Triangulation() const;
   BundleAdjustmentOptions LocalBundleAdjustment() const;

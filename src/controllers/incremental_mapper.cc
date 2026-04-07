@@ -37,6 +37,9 @@
 #include <cstdint>
 #include <unordered_map>
 
+#include <boost/property_tree/json_parser.hpp>
+
+#include "base/camera_rig.h"
 #include "base/pose.h"
 #include "util/misc.h"
 #include "util/string.h"
@@ -55,6 +58,99 @@ size_t TriangulateImage(const IncrementalMapperOptions& options,
 }
 
 /**
+ * @brief [功能描述]：从rig配置JSON中构建当前已注册图像可用的相机rig集合。
+ * @param rig_config_path rig配置JSON文件路径。
+ * @param reconstruction 当前重建结果，仅会使用其中已注册的图像来构建snapshot。
+ * @return std::vector<CameraRig>：可用于RigBundleAdjuster的相机rig列表。
+ */
+std::vector<CameraRig> ReadCameraRigConfig(
+    const std::string& rig_config_path, const Reconstruction& reconstruction) {
+  boost::property_tree::ptree pt;
+  boost::property_tree::read_json(rig_config_path.c_str(), pt);
+
+  std::vector<CameraRig> camera_rigs;
+  for (const auto& rig_config : pt) {
+    CameraRig camera_rig;
+    bool estimate_rig_relative_poses = false;
+
+    std::vector<std::string> image_prefixes;
+    for (const auto& camera : rig_config.second.get_child("cameras")) {
+      const int camera_id = camera.second.get<int>("camera_id");
+      image_prefixes.push_back(camera.second.get<std::string>("image_prefix"));
+
+      Eigen::Vector3d rel_tvec = Eigen::Vector3d::Zero();
+      Eigen::Vector4d rel_qvec = ComposeIdentityQuaternion();
+
+      int index = 0;
+      auto rel_tvec_node = camera.second.get_child_optional("rel_tvec");
+      if (rel_tvec_node) {
+        for (const auto& node : rel_tvec_node.get()) {
+          rel_tvec[index++] = node.second.get_value<double>();
+        }
+      } else {
+        estimate_rig_relative_poses = true;
+      }
+
+      index = 0;
+      auto rel_qvec_node = camera.second.get_child_optional("rel_qvec");
+      if (rel_qvec_node) {
+        for (const auto& node : rel_qvec_node.get()) {
+          rel_qvec[index++] = node.second.get_value<double>();
+        }
+      } else {
+        estimate_rig_relative_poses = true;
+      }
+
+      camera_rig.AddCamera(camera_id, rel_qvec, rel_tvec);
+    }
+
+    camera_rig.SetRefCameraId(rig_config.second.get<int>("ref_camera_id"));
+
+    std::unordered_map<std::string, std::vector<image_t>> snapshots;
+    for (const image_t image_id : reconstruction.RegImageIds()) {
+      const auto& image = reconstruction.Image(image_id);
+      for (const auto& image_prefix : image_prefixes) {
+        if (StringContains(image.Name(), image_prefix)) {
+          const std::string image_suffix =
+              StringGetAfter(image.Name(), image_prefix);
+          snapshots[image_suffix].push_back(image_id);
+        }
+      }
+    }
+
+    for (const auto& snapshot : snapshots) {
+      bool has_ref_camera = false;
+      for (const auto image_id : snapshot.second) {
+        const auto& image = reconstruction.Image(image_id);
+        if (image.CameraId() == camera_rig.RefCameraId()) {
+          has_ref_camera = true;
+          break;
+        }
+      }
+
+      if (has_ref_camera) {
+        camera_rig.AddSnapshot(snapshot.second);
+      }
+    }
+
+    camera_rig.Check(reconstruction);
+    if (estimate_rig_relative_poses) {
+      PrintHeading2("Estimating relative rig poses");
+      if (!camera_rig.ComputeRelativePoses(reconstruction)) {
+        std::cout << "WARNING: Failed to estimate rig poses from current "
+                     "reconstruction, skip rig BA for this round."
+                  << std::endl;
+        return {};
+      }
+    }
+
+    camera_rigs.push_back(camera_rig);
+  }
+
+  return camera_rigs;
+}
+
+/**
  * [功能描述]：执行全局光束法平差，根据条件选择并行BA或普通BA
  * @param options：增量式建图的配置选项
  * @param mapper：增量式建图器指针
@@ -63,6 +159,7 @@ void AdjustGlobalBundle(const IncrementalMapperOptions& options,
                         IncrementalMapper* mapper) {
   // 获取全局BA的配置选项
   BundleAdjustmentOptions custom_ba_options = options.GlobalBundleAdjustment();
+  RigBundleAdjuster::Options rig_ba_options;
 
   // 获取当前已注册的图像数量
   const size_t num_reg_images = mapper->GetReconstruction().NumRegImages();
@@ -81,6 +178,25 @@ void AdjustGlobalBundle(const IncrementalMapperOptions& options,
   }
 
   PrintHeading1("Global bundle adjustment");
+
+  if (options.use_rig_config) {
+    CHECK(!options.rig_config_path.empty())
+        << "Mapper.rig_config_path must not be empty when "
+           "Mapper.use_rig_config is enabled";
+
+    PrintHeading2("Camera rig configuration");
+    auto camera_rigs =
+        ReadCameraRigConfig(options.rig_config_path, mapper->GetReconstruction());
+    if (!camera_rigs.empty()) {
+      mapper->AdjustRigGlobalBundle(options.Mapper(), custom_ba_options,
+                                    rig_ba_options, &camera_rigs);
+      return;
+    }
+
+    std::cout << "WARNING: No valid camera rigs loaded for current "
+                 "reconstruction, fallback to standard global BA."
+              << std::endl;
+  }
 
   // 判断是否使用并行BA（PBA）
   // 需同时满足以下条件：
@@ -578,6 +694,10 @@ IncrementalMapperOptions::ParallelGlobalBundleAdjustment() const {
   return options;
 }
 
+/**
+ * [功能描述]：校验增量SfM控制器选项是否合法，并检查rig配置依赖关系。
+ * @return 配置合法时返回true，否则触发CHECK失败。
+ */
 bool IncrementalMapperOptions::Check() const {
   CHECK_OPTION_GT(min_num_matches, 0);
   CHECK_OPTION_GT(max_num_models, 0);
@@ -601,6 +721,9 @@ bool IncrementalMapperOptions::Check() const {
   CHECK_OPTION_GE(snapshot_images_freq, 0);
   CHECK_OPTION_GE(relative_pose_rotation_weight, 0);
   CHECK_OPTION_GE(relative_pose_translation_weight, 0);
+  if (use_rig_config) {
+    CHECK_OPTION(!rig_config_path.empty());
+  }
   CHECK_OPTION(Mapper().Check());
   CHECK_OPTION(Triangulation().Check());
   return true;

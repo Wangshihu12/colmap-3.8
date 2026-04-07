@@ -105,6 +105,12 @@ MapperInitializationOptionsWidget::MapperInitializationOptionsWidget(
                "init_max_reg_trials", 1);
 }
 
+/**
+ * @brief [功能描述]：构建重建阶段的BA参数面板，并暴露global BA相关的rig配置项。
+ * @param parent 父级Qt控件。
+ * @param options 全局选项管理器，用于读写Mapper配置。
+ * @return 无返回值。
+ */
 MapperBundleAdjustmentOptionsWidget::MapperBundleAdjustmentOptionsWidget(
     QWidget* parent, OptionManager* options)
     : OptionsWidget(parent) {
@@ -143,6 +149,8 @@ MapperBundleAdjustmentOptionsWidget::MapperBundleAdjustmentOptionsWidget(
                1);
   AddOptionDouble(&options->mapper->ba_global_max_refinement_change,
                   "max_refinement_change", 0, 1, 1e-6, 6);
+  AddOptionBool(&options->mapper->use_rig_config, "use_rig_config");
+  AddOptionFilePath(&options->mapper->rig_config_path, "rig_config_path");
 }
 
 MapperFilteringOptionsWidget::MapperFilteringOptionsWidget(

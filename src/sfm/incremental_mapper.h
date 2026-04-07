@@ -212,6 +212,10 @@ class IncrementalMapper {
   // Global bundle adjustment using Ceres Solver or PBA.
   bool AdjustGlobalBundle(const Options& options,
                           const BundleAdjustmentOptions& ba_options);
+  bool AdjustRigGlobalBundle(
+      const Options& options, const BundleAdjustmentOptions& ba_options,
+      const RigBundleAdjuster::Options& rig_ba_options,
+      std::vector<CameraRig>* camera_rigs);
   bool AdjustParallelGlobalBundle(
       const Options& options, const BundleAdjustmentOptions& ba_options,
       const ParallelBundleAdjuster::Options& parallel_ba_options);

@@ -471,6 +471,10 @@ void OptionManager::AddBundleAdjustmentOptions() {
                               &bundle_adjustment->refine_extrinsics);
 }
 
+/**
+ * @brief [功能描述]：注册增量SfM映射阶段的所有可配置选项。
+ * @return 无返回值。
+ */
 void OptionManager::AddMapperOptions() {
   if (added_mapper_options_) {
     return;
@@ -553,6 +557,10 @@ void OptionManager::AddMapperOptions() {
                               &mapper->relative_pose_translation_weight);
   AddAndRegisterDefaultOption("Mapper.normalize_scene",
                               &mapper->normalize_scene);
+  AddAndRegisterDefaultOption("Mapper.use_rig_config",
+                              &mapper->use_rig_config);
+  AddAndRegisterDefaultOption("Mapper.rig_config_path",
+                              &mapper->rig_config_path);
 
   // IncrementalMapper.
   AddAndRegisterDefaultOption("Mapper.init_min_num_inliers",
