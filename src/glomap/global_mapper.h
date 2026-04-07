@@ -45,6 +45,7 @@ struct GlomapOptions {
   // 顶层执行参数。
   int num_threads = -1;
   int random_seed = -1;
+  std::string output_path;
 
   // 位姿图加载阈值。
   size_t min_num_matches = 15;

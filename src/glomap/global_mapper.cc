@@ -24,6 +24,7 @@
 #include "glomap/observation_manager.h"
 #include "sfm/incremental_mapper.h"
 #include "util/logging.h"
+#include "util/misc.h"
 
 namespace colmap {
 namespace {
@@ -64,6 +65,21 @@ void LogPoseGraphStats(const std::string& stage_name, const PoseGraph& pose_grap
             << "，有效边数=" << num_valid_edges
             << "，无效边数=" << num_invalid_edges
             << "，非正权重边数=" << num_nonpositive_edges;
+}
+
+void WriteIntermediateReconstruction(
+    const std::string& output_path,
+    const std::string& dirname,
+    const Reconstruction& reconstruction) {
+  if (output_path.empty()) {
+    return;
+  }
+
+  CreateDirIfNotExists(output_path, true);
+  const std::string intermediate_path = JoinPaths(output_path, dirname);
+  CreateDirIfNotExists(intermediate_path, true);
+  reconstruction.WriteText(intermediate_path);
+  LOG(INFO) << "已输出中间结果到: " << intermediate_path;
 }
 
 // 根据三阶段优化配置生成一个“阶段内专用”的 mapper 选项副本。
@@ -1089,6 +1105,11 @@ bool GlomapMapper::Solve(const GlomapOptions& options) {
         return false;
       }
     }
+
+    // 输出全局定位后的结果，方便查看
+    WriteIntermediateReconstruction(attempt_options.output_path,
+                                    "global_position",
+                                    *reconstruction_);
 
     if (!attempt_options.skip_bundle_adjustment) {
       if (attempt_options.use_three_stage_optimization) {

@@ -153,6 +153,7 @@ bool RunGlomapPipeline(const std::string& database_path,
   options.mapper.min_track_length = 3;
   options.mapper.max_reproj_error = 4.0;
   options.mapper.min_tri_angle = 2.0;
+  options.mapper.output_path = output_path;
   options.mapper.use_three_stage_optimization = true;
   options.mapper.skip_retriangulation = false;
   options.mapper.bundle_adjustment_options.solver_options.max_num_iterations = 50;
