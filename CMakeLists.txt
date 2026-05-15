@@ -70,6 +70,11 @@ if(TESTS_ENABLED)
     enable_testing()
 endif()
 
+if(MSVC)
+    add_compile_options(/utf-8)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 if(BOOST_STATIC)
     set(Boost_USE_STATIC_LIBS ON)
 else()
@@ -88,7 +93,7 @@ if(OPENMP_ENABLED)
     find_package(OpenMP QUIET)
 endif()
 
-set(Ceres_DIR /usr/local/Ceres-2.1.0/lib/cmake/Ceres)
+# set(Ceres_DIR /usr/local/Ceres-2.1.0/lib/cmake/Ceres)
 find_package(Ceres REQUIRED)
 
 find_package(Boost REQUIRED COMPONENTS

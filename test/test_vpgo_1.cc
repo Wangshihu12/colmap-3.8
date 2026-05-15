@@ -54,7 +54,9 @@ using namespace colmap;
 // #include "xgbase/lcc_config_device.h"
 
 #include <ceres/ceres.h>
+#if __has_include(<ceres/local_parameterization.h>)
 #include <ceres/local_parameterization.h>
+#endif
 
 // using namespace xgrids3d;
 using namespace colmap;
